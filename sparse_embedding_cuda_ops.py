@@ -15,18 +15,26 @@ import horovod.torch as hvd
 
 class LookupFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, weights, indices):
-        ctx.save_for_backward(weights, indices)
-        return sparse_embedding_cuda.forward_fast_single(weights, indices)
+    def forward(ctx, weights, indices, offsets=None):
+        ctx.save_for_backward(weights, indices, offsets)
+        if offsets is None:
+            return sparse_embedding_cuda.forward_fast_single(weights, indices)
+        else:
+            return sparse_embedding_cuda.forward_offsets(weights, indices, offsets)
 
     @staticmethod
     def backward(ctx, grad_output):
-        weights, indices = ctx.saved_tensors
+        weights, indices, offsets = ctx.saved_tensors
         # TODO: obvious hack
         LR = 0.05
-        sparse_embedding_cuda.backward_update_fast_single(
-            grad_output, weights, indices, LR)
-        return (torch.cuda.sparse.FloatTensor(*weights.size()), None)
+        if offsets is None:
+            sparse_embedding_cuda.backward_update_fast_single(
+                grad_output, weights, indices, LR)
+            return (torch.cuda.sparse.FloatTensor(*weights.size()), None, None)
+        else:
+            sparse_embedding_cuda.backward_update_offsets(
+                grad_output, weights, indices, offsets, LR)
+            return (torch.cuda.sparse.FloatTensor(*weights.size()), None, None)
 
 
 class UniformShardedEmbeddingBags(nn.Module):
@@ -36,9 +44,9 @@ class UniformShardedEmbeddingBags(nn.Module):
         self.embedding_weights = nn.Parameter(
             torch.randn(num_embeddings, num_tables, embedding_dim))
 
-    def forward(self, sharded_sparse_features):
+    def forward(self, sharded_sparse_features, sharded_offsets=None):
         return LookupFunction.apply(self.embedding_weights,
-                                    sharded_sparse_features)
+                                    sharded_sparse_features, sharded_offsets)
 
 
 class ReduceScatterFunction(torch.autograd.Function):
@@ -98,3 +106,18 @@ class FastZeroFusedSGD(apex.optimizers.FusedSGD):
         apex.multi_tensor_apply.multi_tensor_applier(amp_C.multi_tensor_scale,
                                                      self._overflow_buf,
                                                      [grads, grads], 0.0)
+    def amp_zero_grad(self):
+        stash = self._amp_stash
+        self._amp_lazy_init()
+        # Zero the model grads.
+        grads = [p.grad for group in [stash.all_fp16_params, stash.all_fp32_from_fp32_params] for p in group if p.grad is not None]
+        if not grads:
+            return
+        for grad in grads:
+            grad.detach_()
+
+        apex.multi_tensor_apply.multi_tensor_applier(amp_C.multi_tensor_scale,
+                                                     self._overflow_buf,
+                                                     [grads, grads], 0.0)
+        for param in self._amp_stash.all_fp32_from_fp16_params:
+            param.grad = None

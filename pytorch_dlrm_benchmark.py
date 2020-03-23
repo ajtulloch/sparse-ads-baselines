@@ -11,8 +11,10 @@ from models import SNN, UniformShardedSNN
 
 import logging
 logging.basicConfig(level=logging.DEBUG)
-
+import sys
 import json
+import os
+
 def benchmark_torch_function(iters, f, *args):
     f(*args)
     torch.cuda.synchronize()
@@ -119,8 +121,15 @@ def benchmark_torch_uniform_snn_forward(name,
         return (net if not fp16 else net_fp16)(dense_features,
                                                sharded_sparse_features.random_(0, num_embeddings))
 
-    time_per_batch = benchmark_torch_function(iters, forward, dense_features,
-                                              sharded_sparse_features)
+    if os.environ.get('BIGADS_PROFILE_FORWARD'):
+        with torch.autograd.profiler.profile(use_cuda=True,
+                                             record_shapes=True) as prof:
+            time_per_batch = benchmark_torch_function(iters, forward, dense_features,
+                                                    sharded_sparse_features)
+        prof.export_chrome_trace(("fp16-" if fp16 else "fp32-") + os.environ.get('BIGADS_PROFILE_FORWARD'))
+    else:
+        time_per_batch = benchmark_torch_function(iters, forward, dense_features,
+                                                  sharded_sparse_features)
     if fp16:
         del net_fp16
 
@@ -150,16 +159,16 @@ def benchmark_torch_uniform_snn_forward(name,
         net = torch.jit.trace(net,
                               example_inputs=(dense_features,
                                               sharded_sparse_features))
+        optimizer.zero_grad = optimizer.amp_zero_grad
 
     def forward_backward_update(dense_features, sharded_sparse_features,
                                 labels):
         optimizer.zero_grad()
         logits = net(dense_features, sharded_sparse_features.random_(0, num_embeddings))
-        loss = criterion(logits, labels)
+        loss = criterion(logits.float(), labels)
         loss.backward()
         optimizer.step()
 
-    import os
     if os.environ.get('BIGADS_PROFILE'):
         with torch.autograd.profiler.profile(use_cuda=True,
                                              record_shapes=True) as prof:
@@ -168,7 +177,7 @@ def benchmark_torch_uniform_snn_forward(name,
                                                       dense_features,
                                                       sharded_sparse_features,
                                                       labels)
-        prof.export_chrome_trace(os.environ.get('BIGADS_PROFILE'))
+        prof.export_chrome_trace(("fp16-" if fp16 else "fp32-") + os.environ.get('BIGADS_PROFILE'))
     else:
         time_per_batch = benchmark_torch_function(iters,
                                                   forward_backward_update,
@@ -206,6 +215,11 @@ def cli(num_tables, num_embeddings, embedding_dim, dense_features_dim,
                                             num_embeddings, embedding_dim,
                                             dense_features_dim, batch_size,
                                             bag_size, iters)
+        benchmark_torch_uniform_snn_forward("fused-fp16", num_tables,
+                                            num_embeddings, embedding_dim,
+                                            dense_features_dim, batch_size,
+                                            bag_size, iters, fp16=1)
+
         # benchmark_torch_uniform_snn_forward("fused",
         #                                     num_tables,
         #                                     num_embeddings,
@@ -218,6 +232,7 @@ def cli(num_tables, num_embeddings, embedding_dim, dense_features_dim,
 
     if remote:
         import submitit
+        import sys
         executor = submitit.AutoExecutor(folder="dlrm_perf")
         executor.update_parameters(timeout_min=10,
                                    partition="dev",

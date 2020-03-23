@@ -190,6 +190,15 @@ torch::Tensor sparse_embedding_cuda_forward_fast_kernel(
     // [B][T][L // #device]
     torch::Tensor indices);
 
+
+torch::Tensor sparse_embedding_cuda_forward_offsets_kernel(
+    torch::Tensor weights, torch::Tensor indices, torch::Tensor offsets);
+
+void sparse_embedding_cuda_backward_update_offsets_kernel(
+  torch::Tensor grad_output, torch::Tensor weights, torch::Tensor indices, torch::Tensor offsets,
+  float lr);
+
+
 void sparse_embedding_cuda_backward_update_kernel(torch::Tensor grad_output,
                                                   torch::Tensor weights,
                                                   torch::Tensor indices,
@@ -264,6 +273,21 @@ at::Tensor sparse_embedding_cuda_forward_fast_single(
   return sparse_embedding_cuda_forward_fast_kernel(weights, scattered_indices);
 }
 
+at::Tensor sparse_embedding_cuda_forward_offsets(
+    // [E][T][D]
+    at::Tensor weights,
+    // [\sum_{0 <= b < B, 0 <= t < T} L_{b, t}]
+    at::Tensor indices,
+    // [B][T+1]
+    at::Tensor offsets
+) {
+  // -> [B][T][D]
+  at::cuda::OptionalCUDAGuard device_guard;
+  device_guard.set_index(weights.get_device());
+  return sparse_embedding_cuda_forward_offsets_kernel(weights, indices, offsets);
+}
+
+
 void sparse_embedding_cuda_backward_update_fast_kernel(
     torch::Tensor grad_output, torch::Tensor weights, torch::Tensor indices,
     float lr);
@@ -288,6 +312,15 @@ void sparse_embedding_cuda_backward_update_fast_single(
   sparse_embedding_cuda_backward_update_fast_kernel(grad_output, weights,
                                                     indices, lr);
 }
+
+void sparse_embedding_cuda_backward_update_offsets(
+    torch::Tensor grad_output, torch::Tensor weights, torch::Tensor indices, torch::Tensor offsets,
+    float lr) {
+  at::cuda::OptionalCUDAGuard device_guard;
+  device_guard.set_index(weights.get_device());
+  sparse_embedding_cuda_backward_update_offsets_kernel(grad_output, weights, indices, offsets, lr);
+}
+
 
 static std::pair<MPI_Comm*, int> sparse_embedding_comm() {
   static std::once_flag once;
@@ -456,6 +489,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "sparse_embedding_cuda_forward_single(weights, indices) (CUDA)");
   m.def("forward_fast_single", &sparse_embedding_cuda_forward_fast_single,
         "sparse_embedding_cuda_forward_fast_single(weights, indices) (CUDA)");
+
+  m.def("forward_offsets", &sparse_embedding_cuda_forward_offsets,
+        "sparse_embedding_cuda_forward_offsets(weights, indices, offsets) (CUDA)");
+  m.def("backward_update_offsets", &sparse_embedding_cuda_backward_update_offsets,
+        "sparse_embedding_cuda_backward_update_offsets(weights, indices, offsets) (CUDA)");
 
   m.def("backward_update_single", &sparse_embedding_cuda_backward_update_single,
         "sparse_embedding_cuda_backward_update_single(grad_output, weights, "

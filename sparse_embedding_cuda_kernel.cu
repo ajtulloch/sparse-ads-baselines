@@ -8,6 +8,8 @@
 
 #include <vector>
 
+constexpr int L_max = 200;
+
 static inline __device__ void gpuAtomicAdd(double* address, double val) {
   atomicAdd(address, val);
 }
@@ -36,6 +38,172 @@ static inline __device__ void gpuAtomicAdd(at::Half* address, at::Half val) {
 #else
   atomicAdd(reinterpret_cast<__half*>(address), val);
 #endif
+}
+
+// template <typename scalar_t>
+// __global__ void sparse_embedding_cuda_forward_offsets_impl(
+//     const torch::PackedTensorAccessor64<scalar_t, 3, torch::RestrictPtrTraits>
+//         weights, // [E][T][D]
+//     const torch::PackedTensorAccessor32<int64_t, 1, torch::RestrictPtrTraits>
+//         indices, // [N = B x T total indices,]
+//     const torch::PackedTensorAccessor32<int32_t, 2, torch::RestrictPtrTraits>
+//         offsets, // [B][T+1]
+//     torch::PackedTensorAccessor32<scalar_t, 3, torch::RestrictPtrTraits>
+//         output) {
+//   const int B = offsets.size(0);
+//   const int T_1 = offsets.size(1);
+//   const int T = T_1 - 1;
+//   const int D = weights.size(2);
+//   const int E = weights.size(0);
+//   // nnz: offsets[t][b+1]-offsets[t][b]
+//   int b = blockIdx.x;
+//   int t = blockIdx.y;
+//   int d = threadIdx.x;
+//   const int32_t indices_start = offsets[b][t];
+//   const int32_t indices_end = offsets[b][t+1];
+//   int L = indices_end - indices_start;
+
+//   at::acc_type<scalar_t, true> sum = 0.0f;
+//   #pragma unroll 8
+//   for (int l = 0; l < L; ++l) {
+//     // TODO: does ldg work better?
+//     const int64_t offset = __ldg(&offsets[indices_start + l]);
+//     const int64_t ind = __ldg(&indices[offset]);
+//     // TODO: enable asserts.
+//     // assert(ind >= 0);
+//     // assert(ind < E);
+//     sum += __ldg(&weights[ind][t][d]);
+//   }
+//   output[b][t][d] = sum;
+// }
+
+
+template <typename scalar_t, bool T_blocked>
+__global__ void sparse_embedding_cuda_forward_offsets_kernel_impl(
+    const torch::PackedTensorAccessor64<scalar_t, 3, torch::RestrictPtrTraits>
+        weights,
+    const torch::PackedTensorAccessor32<int64_t, 1, torch::RestrictPtrTraits>
+        indices, // [N = B x T total indices,]
+    const torch::PackedTensorAccessor32<int32_t, 2, torch::RestrictPtrTraits>
+        offsets, // [B][T+1]
+    torch::PackedTensorAccessor32<scalar_t, 3, torch::RestrictPtrTraits>
+        output) {
+
+  extern __shared__ int shmem_indices[];
+
+  const int B = offsets.size(0);
+  const int T_1 = offsets.size(1);
+  const int T = T_1 - 1;
+  const int D = weights.size(2);
+  const int E = weights.size(0);
+  if (!T_blocked) {
+    int d = threadIdx.x;
+    int b = blockIdx.x;
+    int t = blockIdx.y;
+
+    const int32_t indices_start = offsets[b][t];
+    const int32_t indices_end = offsets[b][t+1];
+    int L = indices_end - indices_start;
+
+    for (int i = threadIdx.x; i < L; i += blockDim.x) {
+      shmem_indices[i] = __ldg(&indices[indices_start + i]);
+    }
+    __syncthreads();
+
+    at::acc_type<scalar_t, true> sum = 0.0f;
+#pragma unroll 8
+    for (int l = 0; l < L; ++l) {
+      sum += __ldg((&weights[shmem_indices[l]][t][0]) + d);
+    }
+    output[b][t][d] = sum;
+  } else {
+    int d = threadIdx.x;
+    int t_t = threadIdx.y;
+    int b = blockIdx.x;
+    int t_b = blockIdx.y;
+    int t = blockIdx.y * blockDim.y + threadIdx.y;
+    int L = 0;
+    if (t < T) {
+      const int32_t indices_start = offsets[b][t];
+      const int32_t indices_end = offsets[b][t+1];
+      L = indices_end - indices_start;
+      for (int i = threadIdx.x; i < L; i += blockDim.x) {
+        shmem_indices[t_t * L_max + i] = __ldg(&indices[indices_start + i]);
+      }
+    }
+    __syncthreads();
+    if (t < T) {
+      at::acc_type<scalar_t, true> sum = 0.0f;
+#pragma unroll 8
+      for (int l = 0; l < L; ++l) {
+        sum += __ldg((&weights[shmem_indices[t_t * L_max + l]][t][0]) + d);
+      }
+      output[b][t][d] = sum;
+    }
+  }
+}
+
+template <typename scalar_t, bool T_blocked>
+__global__ void sparse_embedding_cuda_fused_backward_update_offsets_kernel_impl(
+    const torch::PackedTensorAccessor32<scalar_t, 3, torch::RestrictPtrTraits>
+        grad_output,
+    torch::PackedTensorAccessor64<scalar_t, 3, torch::RestrictPtrTraits>
+        weights,
+    const torch::PackedTensorAccessor32<int64_t, 1, torch::RestrictPtrTraits>
+        indices, // [N = B x T total indices,]
+    const torch::PackedTensorAccessor32<int32_t, 2, torch::RestrictPtrTraits>
+        offsets, // [B][T+1]
+    float lr) {
+  extern __shared__ int shmem_indices[];
+
+  const int B = offsets.size(0);
+  const int T_1 = offsets.size(1);
+  const int T = T_1 - 1;
+  const int D = weights.size(2);
+  const int E = weights.size(0);
+  
+  if (!T_blocked) {
+    int d = threadIdx.x;
+    int b = blockIdx.x;
+    int t = blockIdx.y;
+
+    const int32_t indices_start = offsets[b][t];
+    const int32_t indices_end = offsets[b][t+1];
+    int L = indices_end - indices_start;
+
+    for (int i = threadIdx.x; i < L; i += blockDim.x) {
+      shmem_indices[i] = __ldg(&indices[indices_start + i]);
+    }
+    __syncthreads();
+#pragma unroll 8
+    for (int l = 0; l < L; ++l) {
+      const auto g = __ldg(&grad_output[b][t][d]);
+      *((&weights[shmem_indices[l]][t][0]) + d) -= lr * g;
+    }
+  } else {
+    int d = threadIdx.x;
+    int t_t = threadIdx.y;
+    int b = blockIdx.x;
+    int t_b = blockIdx.y;
+    int t = blockIdx.y * blockDim.y + threadIdx.y;
+    int L = 0;
+    if (t < T) {
+      const int32_t indices_start = offsets[b][t];
+      const int32_t indices_end = offsets[b][t+1];
+      L = indices_end - indices_start;
+      for (int i = threadIdx.x; i < L; i += blockDim.x) {
+        shmem_indices[t_t * L_max + i] = __ldg(&indices[indices_start + i]);
+      }
+    }
+    __syncthreads();
+    if (t < T) {
+#pragma unroll 8
+      for (int l = 0; l < L; ++l) {
+        const auto g = __ldg(&grad_output[b][t][d]);
+        *((&weights[shmem_indices[t_t * L_max + l]][t][0]) + d) -= lr * g;
+      }
+    }
+  }
 }
 
 template <typename scalar_t>
@@ -292,6 +460,59 @@ torch::Tensor sparse_embedding_cuda_forward_fast_kernel(
   return output;
 }
 
+
+torch::Tensor sparse_embedding_cuda_forward_offsets_kernel(
+  // [E][T][D]
+  torch::Tensor weights,
+  // [N = \sum_B \sum_T L_{b, t}]
+  torch::Tensor indices, 
+  // [B][T+1]
+  torch::Tensor offsets) {
+  const auto B = offsets.size(0);
+  const auto T_1 = offsets.size(1);
+  const auto T = T_1 - 1;
+  const auto D = weights.size(2);
+  auto output = at::empty({B, T, D}, weights.options());
+  if (D < 64) {
+    const int T_t = std::min<int>(64 / D, 4);
+    const int T_b = (T + T_t - 1) / T_t;
+    const dim3 threads(D, T_t);
+    const dim3 blocks(B, T_b);
+
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+        weights.type(), "sparse_embedding_cuda_forward_offsets", ([&] {
+          sparse_embedding_cuda_forward_offsets_kernel_impl<
+              scalar_t, true><<<blocks, threads, T_t * L_max * sizeof(int),
+                                at::cuda::getCurrentCUDAStream()>>>(
+              weights
+                  .packed_accessor64<scalar_t, 3, torch::RestrictPtrTraits>(),
+              indices.packed_accessor32<int64_t, 1, torch::RestrictPtrTraits>(),
+              offsets.packed_accessor32<int32_t, 2, torch::RestrictPtrTraits>(),
+              output
+                  .packed_accessor32<scalar_t, 3, torch::RestrictPtrTraits>());
+        }));
+    AT_CUDA_CHECK(cudaGetLastError());
+  } else {
+    const int threads = D;
+    const dim3 blocks(B, T);
+
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+        weights.type(), "sparse_embedding_cuda_forward_offsets", ([&] {
+          sparse_embedding_cuda_forward_offsets_kernel_impl<scalar_t, false><<<
+              blocks, threads, L_max * sizeof(int), at::cuda::getCurrentCUDAStream()>>>(
+              weights
+                  .packed_accessor64<scalar_t, 3, torch::RestrictPtrTraits>(),
+              indices.packed_accessor32<int64_t, 1, torch::RestrictPtrTraits>(),
+              offsets.packed_accessor32<int32_t, 2, torch::RestrictPtrTraits>(),
+              output
+                  .packed_accessor32<scalar_t, 3, torch::RestrictPtrTraits>());
+        }));
+    AT_CUDA_CHECK(cudaGetLastError());
+  }
+  return output;
+}
+
+
 void sparse_embedding_cuda_backward_update_kernel(torch::Tensor grad_output,
                                                   torch::Tensor weights,
                                                   torch::Tensor indices,
@@ -365,4 +586,55 @@ void sparse_embedding_cuda_backward_update_fast_kernel(
     AT_CUDA_CHECK(cudaGetLastError());
   }
   return;
+}
+
+void sparse_embedding_cuda_backward_update_offsets_kernel(
+  torch::Tensor grad_output, torch::Tensor weights, torch::Tensor indices, torch::Tensor offsets,
+  float lr) {
+
+const auto B = offsets.size(0);
+const auto T_1 = offsets.size(1);
+const auto T = T_1 - 1;
+const auto D = weights.size(2);
+  
+if (D < 64) {
+  const int T_t = std::min<int>(64 / D, 4);
+  const int T_b = (T + T_t - 1) / T_t;
+  const dim3 threads(D, T_t);
+  const dim3 blocks(B, T_b);
+
+  AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+      weights.type(), "sparse_embedding_cuda_backward_update_offsets", ([&] {
+        sparse_embedding_cuda_fused_backward_update_offsets_kernel_impl<
+            scalar_t, true><<<blocks, threads, T_t * L_max * sizeof(int),
+                              at::cuda::getCurrentCUDAStream()>>>(
+            grad_output
+                .packed_accessor32<scalar_t, 3, torch::RestrictPtrTraits>(),
+            weights
+                .packed_accessor64<scalar_t, 3, torch::RestrictPtrTraits>(),
+            indices.packed_accessor32<int64_t, 1, torch::RestrictPtrTraits>(),
+            offsets.packed_accessor32<int32_t, 2, torch::RestrictPtrTraits>(),
+            lr);
+      }));
+  AT_CUDA_CHECK(cudaGetLastError());
+} else {
+  const int threads = D;
+  const dim3 blocks(B, T);
+
+  AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+      weights.type(), "sparse_embedding_cuda_backward_update_offsets", ([&] {
+        sparse_embedding_cuda_fused_backward_update_offsets_kernel_impl<
+            scalar_t, false><<<blocks, threads, L_max * sizeof(int),
+                               at::cuda::getCurrentCUDAStream()>>>(
+            grad_output
+                .packed_accessor32<scalar_t, 3, torch::RestrictPtrTraits>(),
+            weights
+                .packed_accessor64<scalar_t, 3, torch::RestrictPtrTraits>(),
+            indices.packed_accessor32<int64_t, 1, torch::RestrictPtrTraits>(),
+            offsets.packed_accessor32<int32_t, 2, torch::RestrictPtrTraits>(),
+            lr);
+      }));
+  AT_CUDA_CHECK(cudaGetLastError());
+}
+return;
 }

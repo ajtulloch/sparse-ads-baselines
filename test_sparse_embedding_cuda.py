@@ -22,13 +22,50 @@ def test_forward(T, D, B, L):
     ]
     xs = [torch.randint(low=0, high=E, size=(B, L)).cuda() for _ in range(T)]
     fs = [b(x) for (b, x) in zip(bs, xs)]
+    def b_indices(b, x):
+        (indices, offsets) = get_offsets_from_dense(x)
+        return b(indices, offsets.to(torch.int64))
+
+    fs2 = [b_indices(b, x) for (b, x) in zip(bs, xs)]
+
+    for t in range(T):
+        torch.testing.assert_allclose(fs[t], fs2[t])
+
     f = torch.cat([f.view(B, 1, D) for f in fs], dim=1)
     cc = UniformShardedEmbeddingBags(T, E, D).cuda()
     for t in range(T):
         cc.embedding_weights.data[:, t, :] = bs[t].weight
     x = torch.cat([x.view(B, 1, L) for x in xs], dim=1)
     fc = cc(x)
+
+    (indices, offsets) = get_merged_offsets_from_dense(x)
+    fc2 = cc(indices, offsets)
     torch.testing.assert_allclose(f, fc)
+    torch.testing.assert_allclose(f, fc2)
+
+
+def get_offsets_from_dense(indices):
+    (B, L) = indices.size()
+    return indices.contiguous().view(-1), torch.tensor(np.cumsum(np.asarray([0] + [L for _ in range(B)])[:-1]).astype(np.int32)).cuda()
+
+def get_merged_offsets_from_dense(merged_indices):
+    (B, T, L) = merged_indices.size()
+    # e.g. 
+    # offsets = [B, T + 1]
+    # offsets[b, 0] = offsets[]
+    # offsets[0, 0] = 0
+    # offsets[0, 1] = L
+    # offsets[0, T] = T * L
+    # offsets[1, 0] = T * L
+    # offsets[1, 1] = (T+1) * L
+    merged_offsets = torch.tensor(np.fromfunction(lambda b, t: (b*T + t) * L, (B, T + 1), dtype=np.int32)).cuda()
+    for b in range(B):
+        for t in range(T):
+            assert 0 <= merged_offsets[b, t+1] - merged_offsets[b, t] < 200
+
+    return merged_indices.contiguous().view(-1), merged_offsets
+get_offsets_from_dense
+    
 
 
 @given(st.integers(min_value=1, max_value=4),
@@ -60,6 +97,10 @@ def test_backward(T, D, B, L):
     for t in range(T):
         cc.embedding_weights.data[:, t, :] = bs[t].weight
 
+    cc2 = UniformShardedEmbeddingBags(T, E, D).cuda()
+    for t in range(T):
+        cc2.embedding_weights.data[:, t, :] = bs[t].weight
+
     x = torch.cat([x.view(B, 1, L) for x in xs], dim=1)
 
     fc = cc(x)
@@ -67,6 +108,14 @@ def test_backward(T, D, B, L):
 
     for t in range(T):
         torch.testing.assert_allclose(cc.embedding_weights[:, t, :],
+                                      new_weights[t])
+
+    (indices, offsets) = get_merged_offsets_from_dense(x)
+    fc2 = cc2(indices, offsets)
+    fc2.backward(torch.cat([go.view(B, 1, D) for go in gos], dim=1))
+
+    for t in range(T):
+        torch.testing.assert_allclose(cc2.embedding_weights[:, t, :],
                                       new_weights[t])
 
 

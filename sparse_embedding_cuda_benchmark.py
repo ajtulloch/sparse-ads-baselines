@@ -4,11 +4,22 @@ from torch.nn.parallel.parallel_apply import parallel_apply
 from torch.nn.parallel.replicate import replicate
 from torch.nn.parallel.scatter_gather import gather, scatter
 import horovod.torch as hvd
-
+import numpy as np
 from sparse_embedding_cuda_ops import sparse_embedding_cuda, UniformShardedEmbeddingBags
 import logging
 logging.basicConfig(level=logging.DEBUG)
 import sys
+
+
+def get_offsets_from_dense(indices):
+    (B, L) = indices.size()
+    return indices.contiguous().view(-1), torch.tensor(np.cumsum(np.asarray([0] + [L for _ in range(B)])[:-1]).astype(np.int32)).cuda()
+
+def get_merged_offsets_from_dense(merged_indices):
+    (B, T, L) = merged_indices.size()
+    merged_offsets = torch.tensor(np.fromfunction(lambda b, t: (b*T + t) * L, (B, T + 1), dtype=np.int32)).cuda()
+    return merged_indices.contiguous().view(-1), merged_offsets
+    
 def benchmark_torch_function(iters, f, *args):
     f(*args)
     torch.cuda.synchronize()
@@ -42,13 +53,21 @@ def benchmark_forward(B, E, T, L, D, iters):
     time_per_iter_fast = benchmark_torch_function(
         iters, sparse_embedding_cuda.forward_fast_single, cc.embedding_weights,
         x)
+
+    (indices, offsets) = get_merged_offsets_from_dense(x)
+
+    time_per_iter_fast_offsets = benchmark_torch_function(
+        iters, sparse_embedding_cuda.forward_offsets, cc.embedding_weights,
+        indices, offsets)
+
     import json
     print(json.dumps(dict(B=B, E=E, T=T, D=D, L=L, time_per_iter=time_per_iter_fast, implementation="Fused", method="forward")))
+    print(json.dumps(dict(B=B, E=E, T=T, D=D, L=L, time_per_iter=time_per_iter_fast_offsets, implementation="Fused-Offsets", method="forward")))
     print(json.dumps(dict(B=B, E=E, T=T, D=D, L=L, time_per_iter=time_per_iter, implementation="Fused-Slow", method="forward")))
     print(json.dumps(dict(B=B, E=E, T=T, D=D, L=L, time_per_iter=time_per_iter_sequential, implementation="Baseline", method="forward")))
 
     logging.info(
-        f"Forward, B: {B}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {4 * B * T * L * D / time_per_iter_fast / 1.0e9}GB/s, speedup: {time_per_iter / time_per_iter_fast}, speedup-seq: {time_per_iter_sequential / time_per_iter_fast}"
+        f"Forward, B: {B}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {4 * B * T * L * D / time_per_iter_fast / 1.0e9}GB/s, speedup: {time_per_iter / time_per_iter_fast}, offset-cost: {time_per_iter_fast / time_per_iter_fast_offsets}, speedup-seq: {time_per_iter_sequential / time_per_iter_fast}"
     )
     time_per_iter = benchmark_torch_function(
         iters, sparse_embedding_cuda.backward_update_single, yy,
@@ -56,6 +75,11 @@ def benchmark_forward(B, E, T, L, D, iters):
     time_per_iter_fast = benchmark_torch_function(
         iters, sparse_embedding_cuda.backward_update_fast_single, yy,
         cc.embedding_weights, x, 0.05)
+
+    time_per_iter_fast_offsets = benchmark_torch_function(
+        iters, sparse_embedding_cuda.backward_update_offsets, yy,
+        cc.embedding_weights, indices, offsets, 0.05)
+
     ys = [c(x[:, i, :]) for i, c in enumerate(ccs)]
     gos = [torch.rand_like(y) for y in ys]
     try:
@@ -69,11 +93,12 @@ def benchmark_forward(B, E, T, L, D, iters):
 
 
     print(json.dumps(dict(B=B, E=E, T=T, D=D, L=L, time_per_iter=time_per_iter_fast, implementation="Fused", method="backward")))
+    print(json.dumps(dict(B=B, E=E, T=T, D=D, L=L, time_per_iter=time_per_iter_fast_offsets, implementation="Fused-Offsets", method="backward")))
     print(json.dumps(dict(B=B, E=E, T=T, D=D, L=L, time_per_iter=time_per_iter, implementation="Fused-Slow", method="backward")))
     print(json.dumps(dict(B=B, E=E, T=T, D=D, L=L, time_per_iter=time_per_iter_sequential, implementation="Baseline", method="backward")))
 
     logging.info(
-        f"Backward, B: {B}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {4 * B * T * L * D / time_per_iter_fast / 1.0e9}GB/s, speedup: {time_per_iter / time_per_iter_fast}, speedup-seq: {time_per_iter_sequential / time_per_iter_fast}"
+        f"Backward, B: {B}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {4 * B * T * L * D / time_per_iter_fast / 1.0e9}GB/s, speedup: {time_per_iter / time_per_iter_fast}, offset-cost: {time_per_iter_fast / time_per_iter_fast_offsets}, speedup-seq: {time_per_iter_sequential / time_per_iter_fast}"
     )
 
 @click.command()
