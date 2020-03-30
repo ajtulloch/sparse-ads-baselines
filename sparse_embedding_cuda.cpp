@@ -447,6 +447,91 @@ at::Tensor sparse_embedding_cuda_forward_reduce_scatter(
   return output;
 }
 
+static __inline__ int ncclTypeSize(ncclDataType_t type) {
+  switch (type) {
+    case ncclInt8:
+    case ncclUint8:
+      return 1;
+    case ncclFloat16:
+      return 2;
+    case ncclInt32:
+    case ncclUint32:
+    case ncclFloat32:
+      return 4;
+    case ncclInt64:
+    case ncclUint64:
+    case ncclFloat64:
+      return 8;
+    default:
+      return -1;
+  }
+}
+
+
+at::Tensor sparse_embedding_cuda_forward_all2all_nccl(
+  // [B][T // devices][D])
+  at::Tensor embeddings) {
+
+  // input: [B][T // devices][D]
+  // reinterpret_input: [devices][B // devices][T // devices][D]
+  // output: [B // devices][T][D]
+
+  // at step w:
+  // send input[w][B // devices][T // devices][D] to rank $w$
+  // recv input[w][B // devices][T // devices][D] from rank $w$
+  
+  // now, after all-to-all, 
+  // output is size [devices][B // devices][T // devices][D]
+  // now, transpose to [B // devices][devices][T // devices][D]
+  // now, view as [B // devices][devices * T // devices][D]
+  // then, make contiguous.
+
+
+  using namespace torch::cuda::nccl::detail;
+  const int64_t world_size = sparse_embedding_comm().second;
+  if (world_size == 1) {
+    return embeddings;
+  }
+
+  const auto B = embeddings.size(0);
+  const auto T = embeddings.size(1) * world_size;
+  const auto D = embeddings.size(2);
+  at::cuda::CUDAGuard device_guard(embeddings.get_device());
+  AT_ASSERT(B % world_size == 0);
+
+  auto all_to_all_output = at::empty({world_size, B / world_size, T / world_size, D}, embeddings.options());
+
+  AT_ASSERT(embeddings.is_contiguous());
+  AT_ASSERT(all_to_all_output.is_contiguous());
+
+  AT_ASSERT(embeddings.numel() == all_to_all_output.numel());
+  AT_ASSERT(embeddings.scalar_type() == all_to_all_output.scalar_type());
+
+
+  ncclDataType_t data_type = get_data_type(embeddings);
+  int64_t count = embeddings.numel() / world_size;
+  const auto rank_offset = count * ncclTypeSize(data_type);
+  auto comm = nccl_comm();
+
+  AT_ASSERT(count == B * T * D / world_size / world_size);
+  check_inputs({embeddings}, {all_to_all_output}, 1, 1);
+  auto stream =
+      at::cuda::getCurrentCUDAStream(embeddings.get_device()).stream();
+
+  {
+    pybind11::gil_scoped_release no_gil;
+    AutoNcclGroup nccl_group_guard;
+    for (int r = 0; r < world_size; r++) {
+      // send all tables $t$ from rank $i$ to global batch chunk $j$.
+      // recieve all tables $t$ from rank $j$ for global batch chunk $i$.
+      NCCL_CHECK(ncclSend(((uint8_t*)embeddings.data_ptr()) + r * rank_offset, count, data_type, r, comm, stream));
+      NCCL_CHECK(ncclRecv(((uint8_t*)all_to_all_output.data_ptr()) + r * rank_offset, count, data_type, r, comm, stream));
+    }
+  }
+  auto transposed = all_to_all_output.transpose(1, 0);
+  return transposed.contiguous().view({B / world_size, T, D});
+}
+
 at::Tensor sparse_embedding_cuda_forward_all_gather(
     // [B // #device][T][D]
     at::Tensor embeddings) {
@@ -505,6 +590,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   m.def("forward_all2all", &sparse_embedding_cuda_forward_all2all,
         "sparse_embedding_cuda_forward_all2all(embeddings, result) (CUDA)");
+  m.def("forward_all2all_nccl", &sparse_embedding_cuda_forward_all2all_nccl,
+        "sparse_embedding_cuda_forward_all2all_nccl(embeddings, result) (CUDA)");
+
+
   m.def("forward_reducescatter", &sparse_embedding_cuda_forward_reduce_scatter,
         "sparse_embedding_cuda_forward_reduce_scatter(embeddings) (CUDA)");
   m.def("forward_allgather", &sparse_embedding_cuda_forward_all_gather,

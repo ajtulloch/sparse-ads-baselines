@@ -9,10 +9,10 @@ setup(name='sparse_embedding_cuda',
                   'sparse_embedding_cuda_kernel.cu'
               ],
               include_dirs=[
-                  "/public/apps/NCCL/2.5.6-1/include",
+                  "/private/home/tulloch/src/nccl/2.7.0/src/nccl/build/include",
                   "/public/apps/openmpi/4.0.2/gcc.7.4.0/include"
               ],
-              library_dirs=["/public/apps/openmpi/4.0.2/gcc.7.4.0/lib"],
-              libraries=["mpi"])
+              library_dirs=["/public/apps/openmpi/4.0.2/gcc.7.4.0/lib", "/private/home/tulloch/src/nccl/2.7.0/src/nccl/build/lib"],
+              libraries=["mpi", "nccl"])
       ],
       cmdclass={'build_ext': BuildExtension})

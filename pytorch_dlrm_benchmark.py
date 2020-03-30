@@ -7,7 +7,7 @@ from typing import List
 import horovod.torch as hvd
 import apex
 from sparse_embedding_cuda_ops import UniformShardedEmbeddingBags, FastZeroFusedSGD
-from models import SNN, UniformShardedSNN
+from models import SNN, UniformShardedSNN, Criterion
 
 import logging
 logging.basicConfig(level=logging.DEBUG)
@@ -47,7 +47,9 @@ def benchmark_torch_snn_forward(name, num_tables, num_embeddings,
 
     labels = torch.rand(size=(batch_size, 1),
                         device=torch.cuda.current_device())
-
+    weights = torch.rand(size=(batch_size, 1),
+                        device=torch.cuda.current_device())
+    weights.requires_grad = False
     logits = net(dense_features, sparse_features)
     net = torch.jit.trace(net,
                           example_inputs=(dense_features, sparse_features))
@@ -62,14 +64,14 @@ def benchmark_torch_snn_forward(name, num_tables, num_embeddings,
         f"{name}, DLRM, FORWARD: Batch Size: {batch_size}, Bag Size: {bag_size}, Num Tables: {num_tables}, Embedding Dim: {embedding_dim}, Dense Features Dim: {dense_features_dim}, Time per batch: {time_per_batch * 1.0e6}us, QPS: {batch_size * 1.0 / time_per_batch:.2e}"
     )
     print(json.dumps(dict(name=name, implementation="baseline", method="forward", B=batch_size, L=bag_size, T=num_tables, D=embedding_dim, dense_D=dense_features_dim, time_per_batch=time_per_batch, qps=batch_size * 1.0 / time_per_batch)))
-    criterion = torch.nn.BCEWithLogitsLoss(reduction='mean').cuda()
-    criterion = torch.jit.trace(criterion, example_inputs=(logits, labels))
+    criterion = Criterion().cuda()
+    criterion = torch.jit.trace(criterion, example_inputs=(logits, labels, weights))
     optimizer = torch.optim.SGD(net.parameters(), lr=0.05)
 
     def forward_backward_update(dense_features, sparse_features, labels):
         optimizer.zero_grad()
         logits = net(dense_features, sparse_features)
-        loss = criterion(logits, labels)
+        loss = criterion(logits.float(), labels, weights)
         loss.backward()
         optimizer.step()
 
@@ -102,17 +104,20 @@ def benchmark_torch_uniform_snn_forward(name,
                                             high=num_embeddings,
                                             size=(batch_size, num_tables,
                                                   bag_size),
-                                            device=torch.cuda.current_device())
+                                            device=torch.cuda.current_device()).int()
     # hack - compute grad for sparse-features to avoid having to allocate a grad for weights.
     sharded_sparse_features.requires_grad = False
     labels = torch.rand(size=(batch_size, 1),
                         device=torch.cuda.current_device())
+    weights = torch.rand(size=(batch_size, 1),
+                        device=torch.cuda.current_device())
+    weights.requires_grad = False
 
     if fp16:
         net_fp16 = apex.amp.initialize(net, opt_level="O2", verbosity=0)
-        net_fp16 = torch.jit.trace(net_fp16,
-                                   example_inputs=(dense_features,
-                                                   sharded_sparse_features))
+        # net_fp16 = torch.jit.trace(net_fp16,
+        #                            example_inputs=(dense_features,
+        #                                            sharded_sparse_features))
     net = torch.jit.trace(net,
                           example_inputs=(dense_features,
                                           sharded_sparse_features))
@@ -138,9 +143,9 @@ def benchmark_torch_uniform_snn_forward(name,
     )
     print(json.dumps(dict(name=name, implementation="fused", method="forward", B=batch_size, L=bag_size, T=num_tables, D=embedding_dim, dense_D=dense_features_dim, time_per_batch=time_per_batch, qps=batch_size * 1.0 / time_per_batch)))
 
-    criterion = torch.nn.BCEWithLogitsLoss(reduction='mean').cuda()
+    criterion = Criterion().cuda()
     logits = net(dense_features, sharded_sparse_features)
-    criterion = torch.jit.trace(criterion, example_inputs=(logits, labels))
+    criterion = torch.jit.trace(criterion, example_inputs=(logits, labels, weights))
 
     if fp16:
         net = UniformShardedSNN(num_tables, num_embeddings, embedding_dim,
@@ -156,16 +161,16 @@ def benchmark_torch_uniform_snn_forward(name,
                                              optimizer,
                                              opt_level="O2",
                                              verbosity=0)
-        net = torch.jit.trace(net,
-                              example_inputs=(dense_features,
-                                              sharded_sparse_features))
+        # net = torch.jit.trace(net,
+        #                       example_inputs=(dense_features,
+        #                                       sharded_sparse_features))
         optimizer.zero_grad = optimizer.amp_zero_grad
 
     def forward_backward_update(dense_features, sharded_sparse_features,
                                 labels):
         optimizer.zero_grad()
         logits = net(dense_features, sharded_sparse_features.random_(0, num_embeddings))
-        loss = criterion(logits.float(), labels)
+        loss = criterion(logits.float(), labels, weights)
         loss.backward()
         optimizer.step()
 

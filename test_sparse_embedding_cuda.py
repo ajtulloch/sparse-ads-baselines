@@ -12,19 +12,26 @@ import hypothesis.strategies as st
 @given(st.integers(min_value=1, max_value=4),
        st.integers(min_value=1, max_value=256),
        st.integers(min_value=1, max_value=32),
-       st.integers(min_value=1, max_value=32))
+       st.integers(min_value=1, max_value=32),
+       st.booleans())
 @settings(verbosity=Verbosity.verbose, deadline=None, max_examples=10)
-def test_forward(T, D, B, L):
+def test_forward(T, D, B, L, fp16):
+    if fp16:
+        D *= 4
+
     E = int(1e5)
     bs = [
         torch.nn.EmbeddingBag(E, D, mode='sum', sparse=True).cuda()
         for _ in range(T)
     ]
     xs = [torch.randint(low=0, high=E, size=(B, L)).cuda() for _ in range(T)]
+    if fp16:
+        bs = [b.half() for b in bs]
+
     fs = [b(x) for (b, x) in zip(bs, xs)]
     def b_indices(b, x):
         (indices, offsets) = get_offsets_from_dense(x)
-        return b(indices, offsets.to(torch.int64))
+        return b(indices.long(), offsets.to(torch.int64))
 
     fs2 = [b_indices(b, x) for (b, x) in zip(bs, xs)]
 
@@ -33,10 +40,13 @@ def test_forward(T, D, B, L):
 
     f = torch.cat([f.view(B, 1, D) for f in fs], dim=1)
     cc = UniformShardedEmbeddingBags(T, E, D).cuda()
+    if fp16:
+        cc = cc.half()
+
     for t in range(T):
         cc.embedding_weights.data[:, t, :] = bs[t].weight
     x = torch.cat([x.view(B, 1, L) for x in xs], dim=1)
-    fc = cc(x)
+    fc = cc(x.int())
 
     (indices, offsets) = get_merged_offsets_from_dense(x)
     fc2 = cc(indices, offsets)
@@ -46,7 +56,7 @@ def test_forward(T, D, B, L):
 
 def get_offsets_from_dense(indices):
     (B, L) = indices.size()
-    return indices.contiguous().view(-1), torch.tensor(np.cumsum(np.asarray([0] + [L for _ in range(B)])[:-1]).astype(np.int32)).cuda()
+    return indices.int().contiguous().view(-1), torch.tensor(np.cumsum(np.asarray([0] + [L for _ in range(B)])[:-1]).astype(np.int32)).cuda()
 
 def get_merged_offsets_from_dense(merged_indices):
     (B, T, L) = merged_indices.size()
@@ -59,34 +69,36 @@ def get_merged_offsets_from_dense(merged_indices):
     # offsets[1, 0] = T * L
     # offsets[1, 1] = (T+1) * L
     merged_offsets = torch.tensor(np.fromfunction(lambda b, t: (b*T + t) * L, (B, T + 1), dtype=np.int32)).cuda()
-    for b in range(B):
-        for t in range(T):
-            assert 0 <= merged_offsets[b, t+1] - merged_offsets[b, t] < 200
-
-    return merged_indices.contiguous().view(-1), merged_offsets
-get_offsets_from_dense
-    
+    return merged_indices.int().contiguous().view(-1), merged_offsets
 
 
 @given(st.integers(min_value=1, max_value=4),
        st.integers(min_value=1, max_value=256),
        st.integers(min_value=1, max_value=32),
-       st.integers(min_value=1, max_value=32))
+       st.integers(min_value=1, max_value=32),
+       st.booleans())
 @settings(verbosity=Verbosity.verbose, deadline=None, max_examples=10)
-def test_backward(T, D, B, L):
+def test_backward(T, D, B, L, fp16):
+    if fp16:
+        D *= 4
     E = int(1e5)
     bs = [
         torch.nn.EmbeddingBag(E, D, mode='sum', sparse=True).cuda()
         for _ in range(T)
     ]
+    if fp16:
+        bs = [b.half() for b in bs]
+
     xs = [
         torch.from_numpy(
             np.random.choice(range(E), size=(B, L),
                              replace=False).astype(np.int64)).cuda()
         for _ in range(T)
     ]
-    fs = [b(x) for (b, x) in zip(bs, xs)]
+    fs = [b(x.long()) for (b, x) in zip(bs, xs)]
     gos = [torch.randn_like(f) for f in fs]
+    if fp16:
+        gos = [go.half() for go in gos]
     [f.backward(go) for (f, go) in zip(fs, gos)]
 
     # do SGD update
@@ -94,16 +106,20 @@ def test_backward(T, D, B, L):
     new_weights = [(b.weight - b.weight.grad * lr) for b in bs]
 
     cc = UniformShardedEmbeddingBags(T, E, D).cuda()
+    if fp16:
+        cc = cc.half()
     for t in range(T):
         cc.embedding_weights.data[:, t, :] = bs[t].weight
 
     cc2 = UniformShardedEmbeddingBags(T, E, D).cuda()
+    if fp16:
+        cc2 = cc2.half()
     for t in range(T):
         cc2.embedding_weights.data[:, t, :] = bs[t].weight
 
     x = torch.cat([x.view(B, 1, L) for x in xs], dim=1)
 
-    fc = cc(x)
+    fc = cc(x.int())
     fc.backward(torch.cat([go.view(B, 1, D) for go in gos], dim=1))
 
     for t in range(T):
@@ -165,4 +181,5 @@ def test_all_to_all_forward(B, T, D):
     torch.manual_seed(42)
     E_ranks = torch.randn(hvd.size(), B * hvd.size(), T, D).cuda()
     R = All2AllFunction.apply(E_ranks[hvd.rank()])
+    # print(R)
     # TODO

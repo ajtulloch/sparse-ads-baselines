@@ -6,12 +6,18 @@ from torch.nn.parallel.parallel_apply import parallel_apply
 from torch.nn.parallel.replicate import replicate
 from torch.nn.parallel.scatter_gather import gather, scatter
 import apex
+from ctypes import cdll
+lib1 = cdll.LoadLibrary('libnccl.so.2')
+
 import sparse_embedding_cuda
 from torch.nn.parallel import DistributedDataParallel as DDP
 import numpy as np
 import amp_C
 import apex
 import horovod.torch as hvd
+
+import sys
+
 
 class LookupFunction(torch.autograd.Function):
     @staticmethod
@@ -64,13 +70,16 @@ class All2AllFunction(torch.autograd.Function):
     def forward(ctx, partitioned_embeddings):
         (B, T, D) = partitioned_embeddings.size()
         assert B % hvd.size() == 0
-        butterfly_embeddings = torch.empty(B // hvd.size(),
-                                           T * hvd.size(),
-                                           D,
-                                           device=torch.cuda.current_device())
-        sparse_embedding_cuda.forward_all2all(partitioned_embeddings,
-                                              butterfly_embeddings)
-        return butterfly_embeddings
+        return sparse_embedding_cuda.forward_all2all_nccl(
+            partitioned_embeddings)
+
+        # butterfly_embeddings = torch.empty(B // hvd.size(),
+        #                                    T * hvd.size(),
+        #                                    D,
+        #                                    device=torch.cuda.current_device())
+        # sparse_embedding_cuda.forward_all2all(partitioned_embeddings,
+        #                                       butterfly_embeddings)
+        # return butterfly_embeddings
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -79,13 +88,16 @@ class All2AllFunction(torch.autograd.Function):
         # solution: transpose to (T * hvd.size(), B // hvd.size(), D), make contiguous
         # All2All to get (T, B, D)
         # Transpose to get (B, T, D)
-        (B_div_world_size, T_mul_world_size, D) = grad_output.size()
-        B = B_div_world_size * hvd.size()
-        T = T_mul_world_size // hvd.size()
-        grad_input = torch.empty(T, B, D, device=torch.cuda.current_device())
-        sparse_embedding_cuda.forward_all2all(
-            grad_output.transpose(1, 0).contiguous(), grad_input)
+        # (B_div_world_size, T_mul_world_size, D) = grad_output.size()
+        # B = B_div_world_size * hvd.size()
+        # T = T_mul_world_size // hvd.size()
+        # grad_input = torch.empty(T, B, D, device=torch.cuda.current_device())
+        grad_input = sparse_embedding_cuda.forward_all2all_nccl(
+            grad_output.transpose(1, 0).contiguous())
         return grad_input.transpose(1, 0)
+        # sparse_embedding_cuda.forward_all2all(
+        #     grad_output.transpose(1, 0).contiguous(), grad_input)
+        # return grad_input.transpose(1, 0)
 
 
 class FastZeroFusedSGD(apex.optimizers.FusedSGD):

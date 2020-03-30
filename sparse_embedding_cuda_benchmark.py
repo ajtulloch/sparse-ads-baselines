@@ -33,23 +33,31 @@ def benchmark_torch_function(iters, f, *args):
     return (start_event.elapsed_time(end_event) * 1.0e-3) / iters
 
 
-def benchmark_forward(B, E, T, L, D, iters):
+def benchmark_forward(B, E, T, L, D, iters, fp16):
     cc = UniformShardedEmbeddingBags(T, E, D).cuda()
 
     ccs = [
         torch.nn.EmbeddingBag(E, D, sparse=True, mode="sum").cuda()
         for _ in range(T)
     ]
-    x = torch.randint(low=0, high=E - 1, size=(B, T, L)).cuda()
+
+    x = torch.randint(low=0, high=E - 1, size=(B, T, L)).cuda().int()
+    xi = x.long()
+
+    if fp16:
+        ccs = [x.half() for x in ccs]
+        cc = cc.half()
+
     x.requires_grad = False
     assert tuple(cc.embedding_weights.size()) == (E, T, D)
     assert tuple(x.size()) == (B, T, L)
     assert tuple(cc(x).size()) == (B, T, D)
 
     time_per_iter_sequential = benchmark_torch_function(
-        iters, lambda: [c(x[:, i, :]) for i, c in enumerate(ccs)])
+        iters, lambda: [c(xi[:, i, :]) for i, c in enumerate(ccs)])
     time_per_iter = benchmark_torch_function(iters, cc, x)
     yy = cc(x)
+    print(yy.dtype, yy.shape)
     time_per_iter_fast = benchmark_torch_function(
         iters, sparse_embedding_cuda.forward_fast_single, cc.embedding_weights,
         x)
@@ -80,7 +88,7 @@ def benchmark_forward(B, E, T, L, D, iters):
         iters, sparse_embedding_cuda.backward_update_offsets, yy,
         cc.embedding_weights, indices, offsets, 0.05)
 
-    ys = [c(x[:, i, :]) for i, c in enumerate(ccs)]
+    ys = [c(xi[:, i, :]) for i, c in enumerate(ccs)]
     gos = [torch.rand_like(y) for y in ys]
     try:
         time_per_iter_sequential = benchmark_torch_function(
@@ -109,11 +117,13 @@ def benchmark_forward(B, E, T, L, D, iters):
 @click.option("--bag-size", default=32)
 @click.option("--iters", default=100)
 @click.option("--remote", is_flag=True, default=False)
+@click.option("--fp16", is_flag=True, default=False)
+
 def cli(num_tables, num_embeddings, embedding_dim, batch_size, bag_size, iters,
-        remote):
+        remote, fp16):
     def f():
         benchmark_forward(batch_size, num_embeddings, num_tables, bag_size,
-                          embedding_dim, iters)
+                          embedding_dim, iters, fp16)
 
     if remote:
         import submitit
@@ -127,7 +137,7 @@ def cli(num_tables, num_embeddings, embedding_dim, batch_size, bag_size, iters,
         job.result()
         logging.info("Finished")
         import time
-        time.sleep(1)
+        time.sleep(5)
         print(job.stdout())
         print(job.stderr(), file=sys.stderr)
         logging.info("Finished")
