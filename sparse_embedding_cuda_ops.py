@@ -18,6 +18,8 @@ import horovod.torch as hvd
 
 import sys
 
+import logging
+
 
 class LookupFunction(torch.autograd.Function):
     @staticmethod
@@ -42,13 +44,31 @@ class LookupFunction(torch.autograd.Function):
                 grad_output, weights, indices, offsets, LR)
             return (torch.cuda.sparse.FloatTensor(*weights.size()), None, None)
 
+import enum
+
+class EmbeddingLocation(enum.Enum):
+    DEVICE = 0
+    MANAGED = 1
+    HOST_MAPPED = 2
 
 class UniformShardedEmbeddingBags(nn.Module):
-    def __init__(self, num_tables, num_embeddings, embedding_dim):
+    def __init__(self, num_tables, num_embeddings, embedding_dim, managed=EmbeddingLocation.DEVICE, fp16=False):
         super(UniformShardedEmbeddingBags, self).__init__()
         # Whole tables (i.e. all rows for a table) are partitioned uniformly across devices
-        self.embedding_weights = nn.Parameter(
-            torch.randn(num_embeddings, num_tables, embedding_dim))
+        import table_batched_embeddings
+        # zeros is 2.5x faster than randn for initialization
+        if managed == EmbeddingLocation.MANAGED:
+            logging.info("Allocating managed embedding bag")
+            embedding_data = torch.randn(size=(num_embeddings, num_tables, embedding_dim), 
+                out=table_batched_embeddings.new_managed_tensor(torch.randn(1).cuda() if not fp16 else torch.randn(1).cuda().half(), (num_embeddings, num_tables, embedding_dim)))
+        elif managed == EmbeddingLocation.HOST_MAPPED:
+            logging.info("Allocating host mapped embedding bag")
+            embedding_data = torch.randn(size=(num_embeddings, num_tables, embedding_dim), 
+                out=table_batched_embeddings.new_managed_tensor(torch.randn(1).cuda() if not fp16 else torch.randn(1).cuda().half(), (num_embeddings, num_tables, embedding_dim)))
+        elif managed == EmbeddingLocation.DEVICE:
+            logging.info("Allocating device embedding bag")
+            embedding_data = torch.randn(num_embeddings, num_tables, embedding_dim, device=torch.cuda.current_device(), dtype=torch.float16 if fp16 else torch.float32)
+        self.embedding_weights = nn.Parameter(embedding_data)
 
     def forward(self, sharded_sparse_features, sharded_offsets=None):
         return LookupFunction.apply(self.embedding_weights,
