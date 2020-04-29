@@ -51,6 +51,7 @@ def benchmark_forward(B, E, T, L, D, iters, fp16, managed):
         D,
         optimizer=table_batched_embeddings_ops.Optimizer.APPROX_ROWWISE_ADAGRAD,
         learning_rate=0.1,
+        managed=table_batched_embeddings_ops.EmbeddingLocation.DEVICE if not managed else table_batched_embeddings_ops.EmbeddingLocation.HOST_MAPPED,
         eps=0.1,
         stochastic_rounding=False,
         fp16=fp16,
@@ -138,7 +139,14 @@ def benchmark_forward(B, E, T, L, D, iters, fp16, managed):
             logging.info(
                 f"Backward-SGD, B: {B} {(BT_block_size, shmem)}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {2 * (2 if fp16 else 4) * B * T * L * D / time_per_iter / 1.0e9: .2f}GB/s, T: {time_per_iter * 1.0e6:.0f}us"
             )
-    for BT_block_size in [1, 2, 4, 8, 16, 32, ]:
+    for BT_block_size in [
+        1,
+        2,
+        4,
+        8,
+        16,
+        32,
+    ]:
         time_per_iter = benchmark_torch_function(
             iters,
             w3(table_batched_embeddings.backward_approx_adagrad),

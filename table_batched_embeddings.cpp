@@ -3,18 +3,22 @@
 
 using namespace at;
 
-Tensor batched_embedding_forward_cuda(
-    Tensor weights, Tensor table_offsets, Tensor indices, Tensor offsets, int64_t L_max, int64_t B_block_size, bool shmem);
+Tensor batched_embedding_forward_cuda(Tensor weights, Tensor table_offsets,
+                                      Tensor indices, Tensor offsets,
+                                      c10::optional<Tensor> indice_weights,
+                                      int64_t L_max, int64_t BT_block_size,
+                                      bool shmem);
 
 void batched_embedding_backward_sgd_cuda(Tensor grad_output, Tensor weights,
                                          Tensor table_offsets, Tensor indices,
                                          Tensor offsets, float learning_rate,
                                          int64_t L_max, int64_t T_block_size, bool shmem);
 
-void batched_embedding_backward_adagrad_approx_cuda(
+c10::optional<Tensor> batched_embedding_backward_adagrad_approx_cuda(
     Tensor grad_output, Tensor weights, Tensor table_offsets, Tensor indices,
-    Tensor offsets, Tensor optimizer_state, float learning_rate, float eps,
-    int64_t L_max, bool stochastic_rounding, int64_t BT_block_size);
+    Tensor offsets, c10::optional<Tensor> indice_weights,
+    Tensor optimizer_state, float learning_rate, float eps, int64_t L_max,
+    bool stochastic_rounding, int64_t BT_block_size);
 
 Tensor new_managed_tensor(Tensor self, std::vector<std::int64_t> sizes);
 Tensor new_host_mapped_tensor(Tensor self, std::vector<std::int64_t> sizes);

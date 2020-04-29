@@ -14,6 +14,7 @@ class LookupFunction(torch.autograd.Function):
         table_offsets,
         indices,
         offsets,
+        per_sample_weights,
         optimizer,
         optimizer_state,
         learning_rate,
@@ -26,23 +27,45 @@ class LookupFunction(torch.autograd.Function):
         ctx.learning_rate = learning_rate
         ctx.eps = eps
         ctx.stochastic_rounding = stochastic_rounding
-        ctx.save_for_backward(weights, table_offsets, indices, offsets, optimizer_state)
+        ctx.save_for_backward(
+            weights,
+            table_offsets,
+            indices,
+            offsets,
+            per_sample_weights,
+            optimizer_state,
+        )
         BT_block_size = max(1024 / weights.shape[0], 1) * 4
         L_max = 200  # TODO: pass this in correctly.
         return table_batched_embeddings.forward(
-            weights, table_offsets, indices, offsets, L_max, BT_block_size, False
+            weights,
+            table_offsets,
+            indices,
+            offsets,
+            per_sample_weights,
+            L_max,
+            BT_block_size,
+            False,
         )
 
     @staticmethod
     def backward(ctx, grad_output):
         import table_batched_embeddings
 
-        (weights, table_offsets, indices, offsets, optimizer_state) = ctx.saved_tensors
+        (
+            weights,
+            table_offsets,
+            indices,
+            offsets,
+            per_sample_weights,
+            optimizer_state,
+        ) = ctx.saved_tensors
         L_max = 200
         assert ctx.optimizer in (Optimizer.SGD, Optimizer.APPROX_ROWWISE_ADAGRAD)
         if ctx.optimizer == Optimizer.SGD:
             BT_block_size = max(1024 / weights.shape[0], 1) * 4
-            table_batched_embeddings.backward_sgd(
+            assert per_sample_weights is None
+            grad_per_sample_weight = table_batched_embeddings.backward_sgd(
                 grad_output,
                 weights,
                 table_offsets,
@@ -55,12 +78,13 @@ class LookupFunction(torch.autograd.Function):
             )
         elif ctx.optimizer == Optimizer.APPROX_ROWWISE_ADAGRAD:
             BT_block_size = 1
-            table_batched_embeddings.backward_approx_adagrad(
+            grad_per_sample_weight = table_batched_embeddings.backward_approx_adagrad(
                 grad_output,
                 weights,
                 table_offsets,
                 indices,
                 offsets,
+                per_sample_weights,
                 optimizer_state,
                 ctx.learning_rate,
                 ctx.eps,
@@ -73,6 +97,7 @@ class LookupFunction(torch.autograd.Function):
             None,
             None,
             None,
+            grad_per_sample_weight,
             None,
             None,
             None,
@@ -107,6 +132,7 @@ class TableBatchedEmbeddingBags(nn.Module):
         import table_batched_embeddings
 
         super(TableBatchedEmbeddingBags, self).__init__()
+        assert managed in (EmbeddingLocation.DEVICE, EmbeddingLocation.HOST_MAPPED)
         if managed == EmbeddingLocation.DEVICE:
             logging.info("Allocating device embedding bag")
             embedding_data = torch.randn(
@@ -143,12 +169,15 @@ class TableBatchedEmbeddingBags(nn.Module):
         self.eps = eps
         self.stochastic_rounding = stochastic_rounding
 
-    def forward(self, sharded_sparse_features, sharded_offsets):
+    def forward(
+        self, sharded_sparse_features, sharded_offsets, per_sample_weights=None
+    ):
         return LookupFunction.apply(
             self.embedding_weights,
             self.table_offsets,
             sharded_sparse_features,
             sharded_offsets,
+            per_sample_weights,
             self.optimizer,
             self.optimizer_state,
             self.learning_rate,

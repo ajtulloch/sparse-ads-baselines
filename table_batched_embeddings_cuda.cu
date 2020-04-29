@@ -12,6 +12,8 @@
 
 using namespace at;
 
+#define DEVICE_INLINE __device__ inline __attribute__((always_inline))
+
 namespace {
 
 static constexpr int32_t kWarpSize = 32;
@@ -36,14 +38,14 @@ struct Half4 {
 
 template <> struct Vec4T<Half> {
   float4 acc;
-  inline __device__ Vec4T() {
+  DEVICE_INLINE Vec4T() {
     acc.x = 0;
     acc.y = 0;
     acc.z = 0;
     acc.w = 0;
   }
 
-  inline __device__ Vec4T(const Half *p) {
+  DEVICE_INLINE Vec4T(const Half *p) {
     Half4 out;
 #if CUDA_VERSION >= 9000
     asm("ld.global.v2.u32 {%0, %1}, [%2];"
@@ -64,27 +66,7 @@ template <> struct Vec4T<Half> {
     acc.w = b.y;
   }
 
-  inline __device__ void accumulate(const Half *p) {
-    Half4 out;
-#if CUDA_VERSION >= 9000
-    asm("ld.global.v2.u32 {%0, %1}, [%2];"
-        : "=r"(__HALF2_TO_UI(out.a)), "=r"(__HALF2_TO_UI(out.b))
-        : "l"(p));
-#else
-    asm("ld.global.v2.u32 {%0, %1}, [%2];"
-        : "=r"(out.a.x), "=r"(out.b.x)
-        : "l"(p));
-#endif
-    float2 a = __half22float2(out.a);
-    float2 b = __half22float2(out.b);
-
-    acc.x += a.x;
-    acc.y += a.y;
-    acc.z += b.x;
-    acc.w += b.y;
-  }
-
-  inline __device__ void store(Half *p) {
+  DEVICE_INLINE void store(Half *p) {
     float2 a;
     a.x = acc.x;
     a.y = acc.y;
@@ -102,50 +84,34 @@ template <> struct Vec4T<Half> {
 
 template <> struct Vec4T<float> {
   float4 acc;
-  inline __device__ Vec4T() {
+  DEVICE_INLINE Vec4T() {
     acc.x = 0;
     acc.y = 0;
     acc.z = 0;
     acc.w = 0;
   }
 
-  inline __device__ Vec4T(const float *p) { acc = *((const float4 *)p); }
+  DEVICE_INLINE Vec4T(const float *p) { acc = *((const float4 *)p); }
 
-  inline __device__ void accumulate(const float *p) {
-    auto val = *((const float4 *)p);
-    acc.x += val.x;
-    acc.y += val.y;
-    acc.z += val.z;
-    acc.w += val.w;
-  }
-
-  inline __device__ void store(float *p) { *((float4 *)p) = acc; }
+  DEVICE_INLINE void store(float *p) { *((float4 *)p) = acc; }
 };
 
 template <> struct Vec4T<double> {
   double4 acc;
-  inline __device__ Vec4T() {
+  DEVICE_INLINE Vec4T() {
     acc.x = 0;
     acc.y = 0;
     acc.z = 0;
     acc.w = 0;
   }
 
-  inline __device__ Vec4T(const double *p) { acc = *((const double4 *)p); }
+  DEVICE_INLINE Vec4T(const double *p) { acc = *((const double4 *)p); }
 
-  inline __device__ void accumulate(const double *p) {
-    auto val = *((const double4 *)p);
-    acc.x += val.x;
-    acc.y += val.y;
-    acc.z += val.z;
-    acc.w += val.w;
-  }
-
-  inline __device__ void store(double *p) { *((double4 *)p) = acc; }
+  DEVICE_INLINE void store(double *p) { *((double4 *)p) = acc; }
 };
 
 template <typename T>
-inline __device__ T shfl_xor(const T val, int laneMask, int width = kWarpSize) {
+DEVICE_INLINE T shfl_xor(const T val, int laneMask, int width = kWarpSize) {
 #if CUDA_VERSION >= 9000
   return __shfl_xor_sync(0xffffffff, val, laneMask, width);
 #else
@@ -153,37 +119,25 @@ inline __device__ T shfl_xor(const T val, int laneMask, int width = kWarpSize) {
 #endif
 }
 
-template <typename T> struct Sum {
-  inline __device__ T operator()(T a, T b) const { return a + b; }
-  inline __device__ T identity() const { return static_cast<T>(0); }
-};
-
-template <typename T, typename Op, int ReduceWidth = kWarpSize>
-__device__ inline T warpReduceAll(T val, Op op) {
+/// Sums a register value across all warp threads
+template <typename T, int ReduceWidth = kWarpSize>
+DEVICE_INLINE T warpReduceAllSum(T val) {
 #pragma unroll
   for (int mask = ReduceWidth / 2; mask > 0; mask >>= 1) {
-    val = op(val, shfl_xor(val, mask));
+    val += shfl_xor(val, mask);
   }
-
   return val;
 }
 
-/// Sums a register value across all warp threads
-template <typename T, int ReduceWidth = kWarpSize>
-__device__ inline T warpReduceAllSum(T val) {
-  return warpReduceAll<T, Sum<T>, ReduceWidth>(val, Sum<T>());
-}
-
-static inline __device__ double gpuAtomicAdd(double *address, double val) {
+static DEVICE_INLINE double gpuAtomicAdd(double *address, double val) {
   return atomicAdd(address, val);
 }
 
-static inline __device__ float gpuAtomicAdd(float *address, float val) {
+static DEVICE_INLINE float gpuAtomicAdd(float *address, float val) {
   return atomicAdd(address, val);
 }
 
-static inline __device__ at::Half gpuAtomicAdd(at::Half *address,
-                                               at::Half val) {
+static DEVICE_INLINE at::Half gpuAtomicAdd(at::Half *address, at::Half val) {
 #if ((CUDA_VERSION < 10000) ||                                                 \
      (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700)))
   unsigned int *address_as_ui =
@@ -207,7 +161,34 @@ static inline __device__ at::Half gpuAtomicAdd(at::Half *address,
 }
 }
 
-template <typename scalar_t, bool shared_indices>
+template <typename scalar_t> struct UnweightedForward {
+  DEVICE_INLINE void accumulate(Vec4T<scalar_t> &sum, Vec4T<scalar_t> weight,
+                                int32_t indices_offset) {
+    sum.acc.x += weight.acc.x;
+    sum.acc.y += weight.acc.y;
+    sum.acc.z += weight.acc.z;
+    sum.acc.w += weight.acc.w;
+  }
+};
+
+template <typename scalar_t> struct WeightedForward {
+  const PackedTensorAccessor32<scalar_t, 1, RestrictPtrTraits> indice_weights_;
+
+  WeightedForward(const PackedTensorAccessor32<scalar_t, 1, RestrictPtrTraits>
+                      indice_weights)
+      : indice_weights_(indice_weights) {}
+
+  DEVICE_INLINE void accumulate(Vec4T<scalar_t> &sum, Vec4T<scalar_t> weight,
+                                int32_t indices_offset) {
+    acc_type<scalar_t, true> element_weight = indice_weights_[indices_offset];
+    sum.acc.x += weight.acc.x * element_weight;
+    sum.acc.y += weight.acc.y * element_weight;
+    sum.acc.z += weight.acc.z * element_weight;
+    sum.acc.w += weight.acc.w * element_weight;
+  }
+};
+
+template <typename scalar_t, bool shared_indices, typename F>
 __global__ void batched_embedding_forward_kernel_1(
     // [\sum_t E_t][D]
     const PackedTensorAccessor64<scalar_t, 2, RestrictPtrTraits> weights,
@@ -221,7 +202,8 @@ __global__ void batched_embedding_forward_kernel_1(
     // offsets = cumsum([0] + lengths.contiguous()), where lengths L is [B][T].
     PackedTensorAccessor32<scalar_t, 3, RestrictPtrTraits>
         output, // [B][T][D],
-    int32_t L_max) {
+    int32_t L_max,
+    F f) {
 
   extern __shared__ int32_t shmem_indices[];
 
@@ -248,7 +230,8 @@ __global__ void batched_embedding_forward_kernel_1(
       Vec4T<scalar_t> sum;
       for (int32_t l = 0; l < L; ++l) {
         auto idx = shmem_indices[shmem_offset + l];
-        sum.accumulate((&weights[table_offset + idx][0]) + d * 4);
+        Vec4T<scalar_t> weight((&weights[table_offset + idx][0]) + d * 4);
+        f.accumulate(sum, weight, indices_start + l);
       }
       sum.store((&output[b][t][0]) + d * 4);
     }
@@ -257,7 +240,8 @@ __global__ void batched_embedding_forward_kernel_1(
       Vec4T<scalar_t> sum;
       for (int32_t l = 0; l < L; ++l) {
         auto idx = __ldg(&indices[indices_start + l]);
-        sum.accumulate((&weights[table_offset + idx][0]) + d * 4);
+        Vec4T<scalar_t> weight((&weights[table_offset + idx][0]) + d * 4);
+        f.accumulate(sum, weight, indices_start + l);
       }
       sum.store((&output[b][t][0]) + d * 4);
     }
@@ -266,6 +250,7 @@ __global__ void batched_embedding_forward_kernel_1(
 
 Tensor batched_embedding_forward_cuda(Tensor weights, Tensor table_offsets,
                                       Tensor indices, Tensor offsets,
+                                      c10::optional<Tensor> indice_weights,
                                       int64_t L_max, int64_t BT_block_size,
                                       bool shmem) {
   at::cuda::OptionalCUDAGuard device_guard;
@@ -284,36 +269,46 @@ Tensor batched_embedding_forward_cuda(Tensor weights, Tensor table_offsets,
   }
   AT_ASSERT((B * T) % BT_block_size == 0);
   AT_ASSERT(D % 4 == 0);
+  const dim3 threads(std::min(D / 4, kMaxThreads / BT_block_size),
+                     BT_block_size);
+  const dim3 blocks((B * T) / BT_block_size);
+
+#define X(shmem_param, shmem_size, functor)                                    \
+  batched_embedding_forward_kernel_1<scalar_t, (shmem_param)><<<               \
+      blocks, threads, (shmem_size), at::cuda::getCurrentCUDAStream()>>>(      \
+      weights.packed_accessor64<scalar_t, 2, RestrictPtrTraits>(),             \
+      table_offsets.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),        \
+      indices.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),              \
+      offsets.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),              \
+      output.packed_accessor32<scalar_t, 3, RestrictPtrTraits>(),              \
+      static_cast<int32_t>(L_max), (functor))
 
   auto output = empty({B, T, D}, weights.options());
   AT_DISPATCH_FLOATING_TYPES_AND_HALF(
       weights.type(), "batched_embedding_forward_kernel", ([&] {
-        const dim3 threads(std::min(D / 4, kMaxThreads / BT_block_size),
-                           BT_block_size);
-        const dim3 blocks((B * T) / BT_block_size);
         if (shmem) {
-          batched_embedding_forward_kernel_1<
-              scalar_t,
-              true><<<blocks, threads, BT_block_size * L_max * sizeof(int32_t),
-                      at::cuda::getCurrentCUDAStream()>>>(
-              weights.packed_accessor64<scalar_t, 2, RestrictPtrTraits>(),
-              table_offsets.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
-              indices.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
-              offsets.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
-              output.packed_accessor32<scalar_t, 3, RestrictPtrTraits>(),
-              static_cast<int32_t>(L_max));
+          if (indice_weights) {
+            X(true, BT_block_size * L_max * sizeof(int32_t),
+              WeightedForward<scalar_t>(
+                  indice_weights
+                      ->packed_accessor32<scalar_t, 1, RestrictPtrTraits>()));
+          } else {
+            X(true, BT_block_size * L_max * sizeof(int32_t),
+              UnweightedForward<scalar_t>());
+          }
         } else {
-          batched_embedding_forward_kernel_1<
-              scalar_t,
-              false><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
-              weights.packed_accessor64<scalar_t, 2, RestrictPtrTraits>(),
-              table_offsets.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
-              indices.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
-              offsets.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
-              output.packed_accessor32<scalar_t, 3, RestrictPtrTraits>(),
-              static_cast<int32_t>(L_max));
+          if (indice_weights) {
+            X(false, 0,
+              WeightedForward<scalar_t>(
+                  indice_weights
+                      ->packed_accessor32<scalar_t, 1, RestrictPtrTraits>()));
+          } else {
+            X(false, 0, UnweightedForward<scalar_t>());
+          }
         }
       }));
+
+#undef X
   AT_CUDA_CHECK(cudaGetLastError());
   return output;
 }
@@ -321,14 +316,6 @@ Tensor batched_embedding_forward_cuda(Tensor weights, Tensor table_offsets,
 template <typename scalar_t, bool use_atomics> struct SGDFunctor {
   SGDFunctor(float learning_rate) : learning_rate_(learning_rate) {}
   float learning_rate_;
-  inline void __device__ operator()(scalar_t *weight, scalar_t grad) {
-    if (use_atomics) {
-      // TODO: stochastic rounding for fp16?
-      gpuAtomicAdd(weight, -learning_rate_ * grad);
-    } else {
-      *weight -= grad * learning_rate_;
-    }
-  }
 
   inline void __device__ operator()(scalar_t *weight, Vec4T<scalar_t> grad) {
     // don't handle atomic case.
@@ -445,6 +432,216 @@ void batched_embedding_backward_sgd_cuda(Tensor grad_output, Tensor weights,
   return;
 }
 
+template <typename scalar_t, bool use_atomics> struct AdaGradFunctor {
+  AdaGradFunctor(float learning_rate, float eps)
+      : learning_rate_(learning_rate), eps_(eps) {}
+  float learning_rate_;
+  float eps_;
+  DEVICE_INLINE acc_type<scalar_t, true>
+  update_momentum(acc_type<scalar_t, true> sum_square_grads,
+                  acc_type<scalar_t, true> *optimizer_state,
+                  int32_t indices_offset) {
+    acc_type<scalar_t, true> old_sum_square_grads;
+    if (use_atomics) {
+      old_sum_square_grads = gpuAtomicAdd(optimizer_state, sum_square_grads);
+    } else {
+      old_sum_square_grads = __ldg(optimizer_state);
+      *optimizer_state = old_sum_square_grads + sum_square_grads;
+    }
+    return learning_rate_ *
+           (1.0 / (sqrt(old_sum_square_grads + sum_square_grads) + eps_));
+  }
+
+  struct State {};
+  DEVICE_INLINE State init_update(int thread_id) { return State{}; }
+
+  DEVICE_INLINE void update_weight(scalar_t *weight,
+                                   acc_type<scalar_t, true> multiplier,
+                                   Vec4T<scalar_t> grad, State &state,
+                                   State &sample_weight_state) {
+    // can't use atomics.
+    Vec4T<scalar_t> weight_new(weight);
+    weight_new.acc.x -= grad.acc.x * multiplier;
+    weight_new.acc.y -= grad.acc.y * multiplier;
+    weight_new.acc.z -= grad.acc.z * multiplier;
+    weight_new.acc.w -= grad.acc.w * multiplier;
+    weight_new.store(weight);
+  }
+
+  DEVICE_INLINE State init_sample_weight(int32_t indices_offset) {
+    return State{};
+  }
+  DEVICE_INLINE void update_sample_weight(State &state,
+                                          int32_t indices_offset) {
+    return;
+  }
+};
+
+template <typename scalar_t, bool use_atomics> struct WeightedAdaGradFunctor {
+  WeightedAdaGradFunctor(
+      float learning_rate, float eps,
+      const PackedTensorAccessor32<scalar_t, 1, RestrictPtrTraits>
+          indice_weights,
+      PackedTensorAccessor32<scalar_t, 1, RestrictPtrTraits>
+          grad_indice_weights)
+      : learning_rate_(learning_rate), eps_(eps),
+        indice_weights_(indice_weights),
+        grad_indice_weights_(grad_indice_weights) {}
+
+  float learning_rate_;
+  float eps_;
+  const PackedTensorAccessor32<scalar_t, 1, RestrictPtrTraits> indice_weights_;
+  PackedTensorAccessor32<scalar_t, 1, RestrictPtrTraits> grad_indice_weights_;
+
+  DEVICE_INLINE acc_type<scalar_t, true>
+  update_momentum(acc_type<scalar_t, true> sum_square_grads,
+                  acc_type<scalar_t, true> *optimizer_state,
+                  int32_t indices_offset) {
+    acc_type<scalar_t, true> element_weight = indice_weights_[indices_offset];
+    acc_type<scalar_t, true> weighted_sum_square_grads =
+        sum_square_grads * element_weight * element_weight;
+    acc_type<scalar_t, true> old_sum_square_grads;
+    if (use_atomics) {
+      old_sum_square_grads =
+          gpuAtomicAdd(optimizer_state, weighted_sum_square_grads);
+    } else {
+      old_sum_square_grads = __ldg(optimizer_state);
+      *optimizer_state = old_sum_square_grads + weighted_sum_square_grads;
+    }
+    return element_weight * learning_rate_ *
+           (1.0 /
+            (sqrt(old_sum_square_grads + weighted_sum_square_grads) + eps_));
+  }
+
+  struct State {};
+  DEVICE_INLINE State init_update(int thread_id) { return State{}; }
+
+  DEVICE_INLINE void
+  update_weight(scalar_t *weight, acc_type<scalar_t, true> multiplier,
+                Vec4T<scalar_t> grad, State &state,
+                acc_type<scalar_t, true> &sample_weight_state) {
+    // can't use atomics.
+    Vec4T<scalar_t> weight_new(weight);
+
+    sample_weight_state +=
+        weight_new.acc.x * grad.acc.x + weight_new.acc.y * grad.acc.y +
+        weight_new.acc.z * grad.acc.z + weight_new.acc.w * grad.acc.w;
+
+    weight_new.acc.x -= grad.acc.x * multiplier;
+    weight_new.acc.y -= grad.acc.y * multiplier;
+    weight_new.acc.z -= grad.acc.z * multiplier;
+    weight_new.acc.w -= grad.acc.w * multiplier;
+    weight_new.store(weight);
+  }
+  DEVICE_INLINE acc_type<scalar_t, true>
+  init_sample_weight(int32_t indices_offset) {
+    return 0.0;
+  }
+
+  DEVICE_INLINE void
+  update_sample_weight(acc_type<scalar_t, true> &sample_weight_state,
+                       int32_t indices_offset) {
+    auto accumulated_sample_weight_state =
+        warpReduceAllSum<acc_type<scalar_t, true>>(sample_weight_state);
+    // one thread per warp responsible for updating parameter.
+    // TODO: ugly?
+    if (threadIdx.x == 0) {
+      grad_indice_weights_[indices_offset] = accumulated_sample_weight_state;
+    }
+  }
+};
+
+template <typename scalar_t>
+DEVICE_INLINE void stochastic_rounding_vector(scalar_t *output,
+                                              Vec4T<scalar_t> value,
+                                              uint4 random_bits) {
+  value.store(output);
+}
+
+template <>
+DEVICE_INLINE void stochastic_rounding_vector(Half *output, Vec4T<Half> value,
+                                              uint4 random_bits) {
+  Half4 v;
+
+  v.a.x = __float2half_rz(
+      __uint_as_float(__float_as_uint(value.acc.x) + (random_bits.x >> 19)));
+  v.a.y = __float2half_rz(
+      __uint_as_float(__float_as_uint(value.acc.y) + (random_bits.y >> 19)));
+  v.b.x = __float2half_rz(
+      __uint_as_float(__float_as_uint(value.acc.z) + (random_bits.z >> 19)));
+  v.b.y = __float2half_rz(
+      __uint_as_float(__float_as_uint(value.acc.w) + (random_bits.w >> 19)));
+  v.store(output);
+}
+
+template <typename scalar_t, bool use_atomics>
+struct StochasticRoundingWeightedAdaGradFunctor
+    : public WeightedAdaGradFunctor<scalar_t, use_atomics> {
+  StochasticRoundingWeightedAdaGradFunctor(
+      float learning_rate, float eps,
+      const PackedTensorAccessor32<scalar_t, 1, RestrictPtrTraits>
+          indice_weights,
+      PackedTensorAccessor32<scalar_t, 1, RestrictPtrTraits>
+          grad_indice_weights,
+      std::pair<uint64_t, uint64_t> seeds)
+      : WeightedAdaGradFunctor<scalar_t, use_atomics>(
+            learning_rate, eps, indice_weights, grad_indice_weights),
+        seeds_(seeds) {}
+  std::pair<uint64_t, uint64_t> seeds_;
+
+  DEVICE_INLINE curandStatePhilox4_32_10_t init_update(int thread_id) {
+    curandStatePhilox4_32_10_t state;
+    curand_init(seeds_.first, thread_id, seeds_.second, &state);
+    return state;
+  }
+
+  DEVICE_INLINE void
+  update_weight(scalar_t *weight, acc_type<scalar_t, true> multiplier,
+                Vec4T<scalar_t> grad, curandStatePhilox4_32_10_t &state,
+                acc_type<scalar_t, true> &sample_weight_state) {
+    Vec4T<scalar_t> weight_new(weight);
+    sample_weight_state +=
+        weight_new.acc.x * grad.acc.x + weight_new.acc.y * grad.acc.y +
+        weight_new.acc.z * grad.acc.z + weight_new.acc.w * grad.acc.w;
+    weight_new.acc.x -= grad.acc.x * multiplier;
+    weight_new.acc.y -= grad.acc.y * multiplier;
+    weight_new.acc.z -= grad.acc.z * multiplier;
+    weight_new.acc.w -= grad.acc.w * multiplier;
+    uint4 bits = curand4(&state);
+    stochastic_rounding_vector(weight, weight_new, bits);
+  }
+};
+
+template <typename scalar_t, bool use_atomics>
+struct StochasticRoundingAdaGradFunctor
+    : public AdaGradFunctor<scalar_t, use_atomics> {
+  StochasticRoundingAdaGradFunctor(float learning_rate, float eps,
+                                   std::pair<uint64_t, uint64_t> seeds)
+      : AdaGradFunctor<scalar_t, use_atomics>(learning_rate, eps),
+        seeds_(seeds) {}
+  std::pair<uint64_t, uint64_t> seeds_;
+
+  DEVICE_INLINE curandStatePhilox4_32_10_t init_update(int thread_id) {
+    curandStatePhilox4_32_10_t state;
+    curand_init(seeds_.first, thread_id, seeds_.second, &state);
+    return state;
+  }
+
+  DEVICE_INLINE void
+  update_weight(scalar_t *weight, acc_type<scalar_t, true> multiplier,
+                Vec4T<scalar_t> grad, curandStatePhilox4_32_10_t &state,
+                typename AdaGradFunctor<scalar_t, use_atomics>::State
+                    &sample_weight_state) {
+    Vec4T<scalar_t> weight_new(weight);
+    weight_new.acc.x -= grad.acc.x * multiplier;
+    weight_new.acc.y -= grad.acc.y * multiplier;
+    weight_new.acc.z -= grad.acc.z * multiplier;
+    weight_new.acc.w -= grad.acc.w * multiplier;
+    uint4 bits = curand4(&state);
+    stochastic_rounding_vector(weight, weight_new, bits);
+  }
+};
+
 template <typename scalar_t, typename F>
 __global__ void batched_embedding_backward_adagrad_approx_kernel_1(
     const PackedTensorAccessor32<scalar_t, 3, RestrictPtrTraits> grad_output,
@@ -485,159 +682,30 @@ __global__ void batched_embedding_backward_adagrad_approx_kernel_1(
                              threadIdx.y * blockDim.x + threadIdx.x);
   for (int32_t i = threadIdx.x; i < L; i += blockDim.x) {
     auto idx = __ldg(&indices[indices_start + i]);
-    shmem_multipliers[threadIdx.y * L_max + i] =
-        f.update_momentum(g_sum_square, &optimizer_state[table_offset + idx]);
+    shmem_multipliers[threadIdx.y * L_max + i] = f.update_momentum(
+        g_sum_square, &optimizer_state[table_offset + idx], indices_start + i);
   }
   __syncthreads();
   for (int32_t l = 0; l < L; ++l) {
     auto idx = indices[indices_start + l];
     acc_type<scalar_t, true> multiplier =
         shmem_multipliers[threadIdx.y * L_max + l];
+
+    auto sample_weight_state = f.init_sample_weight(indices_start + l);
     for (int32_t d = threadIdx.x; d * 4 < D; d += blockDim.x) {
+      Vec4T<scalar_t> grad_out(&grad_output[b][t][0] + d * 4);
       f.update_weight(&weights[table_offset + idx][0] + d * 4, multiplier,
-                      Vec4T<scalar_t>(&grad_output[b][t][0] + d * 4), state);
+                      grad_out, state, sample_weight_state);
     }
+    f.update_sample_weight(sample_weight_state, indices_start + l);
   }
 }
 
-template <typename scalar_t, bool use_atomics> struct AdaGradFunctor {
-  AdaGradFunctor(float learning_rate, float eps)
-      : learning_rate_(learning_rate), eps_(eps) {}
-  float learning_rate_;
-  float eps_;
-  __device__ inline __attribute__((always_inline)) acc_type<scalar_t, true>
-  update_momentum(acc_type<scalar_t, true> sum_square_grads,
-                  acc_type<scalar_t, true> *optimizer_state) {
-    acc_type<scalar_t, true> old_sum_square_grads;
-    if (use_atomics) {
-      old_sum_square_grads = gpuAtomicAdd(optimizer_state, sum_square_grads);
-    } else {
-      old_sum_square_grads = __ldg(optimizer_state);
-      *optimizer_state = old_sum_square_grads + sum_square_grads;
-    }
-    return learning_rate_ *
-           (1.0 / (sqrt(old_sum_square_grads + sum_square_grads) + eps_));
-  }
-  struct State {};
-
-  __device__ inline __attribute__((always_inline)) State
-  init_update(int thread_id) {
-    return State{};
-  }
-
-  __device__ inline __attribute__((always_inline)) void
-  update_weight(scalar_t *weight, acc_type<scalar_t, true> multiplier,
-                scalar_t grad, State &state) {
-    if (use_atomics) {
-      gpuAtomicAdd(weight, -multiplier * grad);
-    } else {
-      *weight -= grad * multiplier;
-    }
-  }
-
-  __device__ inline __attribute__((always_inline)) void
-  update_weight(scalar_t *weight, acc_type<scalar_t, true> multiplier,
-                Vec4T<scalar_t> grad, State &state) {
-    // can't use atomics.
-    Vec4T<scalar_t> weight_new(weight);
-    weight_new.acc.x -= grad.acc.x * multiplier;
-    weight_new.acc.y -= grad.acc.y * multiplier;
-    weight_new.acc.z -= grad.acc.z * multiplier;
-    weight_new.acc.w -= grad.acc.w * multiplier;
-    weight_new.store(weight);
-  }
-};
-
-template <typename scalar_t>
-__device__ inline __attribute__((always_inline)) void
-stochastic_rounding_scalar(scalar_t *output, acc_type<scalar_t, true> value,
-                           uint32_t random_bits) {
-  *output = value;
-}
-
-template <>
-__device__ inline __attribute__((always_inline)) void
-stochastic_rounding_scalar(Half *output, float value, uint32_t random_bits) {
-  *output = __float2half_rz(
-      __uint_as_float(__float_as_uint(value) + (random_bits >> 19)));
-}
-
-template <typename scalar_t>
-__device__ inline __attribute__((always_inline)) void
-stochastic_rounding_vector(scalar_t *output, Vec4T<scalar_t> value,
-                           uint4 random_bits) {
-  value.store(output);
-}
-
-template <>
-__device__ inline __attribute__((always_inline)) void
-stochastic_rounding_vector(Half *output, Vec4T<Half> value, uint4 random_bits) {
-  Half4 v;
-
-  v.a.x = __float2half_rz(
-      __uint_as_float(__float_as_uint(value.acc.x) + (random_bits.x >> 19)));
-  v.a.y = __float2half_rz(
-      __uint_as_float(__float_as_uint(value.acc.y) + (random_bits.y >> 19)));
-  v.b.x = __float2half_rz(
-      __uint_as_float(__float_as_uint(value.acc.z) + (random_bits.z >> 19)));
-  v.b.y = __float2half_rz(
-      __uint_as_float(__float_as_uint(value.acc.w) + (random_bits.w >> 19)));
-  v.store(output);
-}
-
-template <typename scalar_t, bool use_atomics>
-struct StochasticRoundingAdaGradFunctor
-    : public AdaGradFunctor<scalar_t, use_atomics> {
-  StochasticRoundingAdaGradFunctor(float learning_rate, float eps,
-                                   std::pair<uint64_t, uint64_t> seeds)
-      : AdaGradFunctor<scalar_t, use_atomics>(learning_rate, eps),
-        seeds_(seeds) {}
-  std::pair<uint64_t, uint64_t> seeds_;
-
-  __device__ inline __attribute__((always_inline)) curandStatePhilox4_32_10_t
-  init_update(int thread_id) {
-    curandStatePhilox4_32_10_t state;
-    curand_init(seeds_.first, thread_id, seeds_.second, &state);
-    return state;
-  }
-
-  __device__ inline __attribute__((always_inline)) void
-  stochastic_rounding(scalar_t *output, acc_type<scalar_t, true> value,
-                      uint32_t bits) {
-    stochastic_rounding_scalar(output, value, bits);
-  }
-
-  __device__ inline __attribute__((always_inline)) void
-  stochastic_rounding(scalar_t *output, Vec4T<scalar_t> value, uint4 bits) {
-    stochastic_rounding_vector(output, value, bits);
-  }
-
-  __device__ inline __attribute__((always_inline)) void
-  update_weight(scalar_t *weight, acc_type<scalar_t, true> multiplier,
-                scalar_t grad, curandStatePhilox4_32_10_t &state) {
-    acc_type<scalar_t, true> w_new =
-        *weight - multiplier * static_cast<acc_type<scalar_t, true>>(grad);
-    uint32_t bits = curand(&state);
-    stochastic_rounding(weight, w_new, bits);
-  }
-
-  __device__ inline __attribute__((always_inline)) void
-  update_weight(scalar_t *weight, acc_type<scalar_t, true> multiplier,
-                Vec4T<scalar_t> grad, curandStatePhilox4_32_10_t &state) {
-    Vec4T<scalar_t> weight_new(weight);
-    weight_new.acc.x -= grad.acc.x * multiplier;
-    weight_new.acc.y -= grad.acc.y * multiplier;
-    weight_new.acc.z -= grad.acc.z * multiplier;
-    weight_new.acc.w -= grad.acc.w * multiplier;
-    uint4 bits = curand4(&state);
-    stochastic_rounding(weight, weight_new, bits);
-  }
-};
-
-void batched_embedding_backward_adagrad_approx_cuda(
+c10::optional<Tensor> batched_embedding_backward_adagrad_approx_cuda(
     Tensor grad_output, Tensor weights, Tensor table_offsets, Tensor indices,
-    Tensor offsets, Tensor optimizer_state, float learning_rate, float eps,
-    int64_t L_max, bool stochastic_rounding, int64_t BT_block_size) {
+    Tensor offsets, c10::optional<Tensor> indice_weights,
+    Tensor optimizer_state, float learning_rate, float eps, int64_t L_max,
+    bool stochastic_rounding, int64_t BT_block_size) {
   at::cuda::OptionalCUDAGuard device_guard;
   device_guard.set_index(weights.get_device());
 
@@ -655,24 +723,42 @@ void batched_embedding_backward_adagrad_approx_cuda(
   }
   AT_ASSERT(D % 4 == 0);
   AT_ASSERT(BT_block_size * kWarpSize <= kMaxThreads);
+  const dim3 threads(kWarpSize, BT_block_size);
+  const dim3 blocks((B * T) / BT_block_size);
+  c10::optional<Tensor> grad_indice_weights = c10::nullopt;
+  if (indice_weights) {
+    grad_indice_weights = at::empty(indices.sizes(), grad_output.options());
+  }
+
+#define X(functor)                                                             \
+  batched_embedding_backward_adagrad_approx_kernel_1<                          \
+      scalar_t><<<blocks, threads,                                             \
+                  BT_block_size * L_max * sizeof(acc_type<scalar_t, true>),    \
+                  at::cuda::getCurrentCUDAStream()>>>(                         \
+      grad_output.packed_accessor32<scalar_t, 3, RestrictPtrTraits>(),         \
+      weights.packed_accessor64<scalar_t, 2, RestrictPtrTraits>(),             \
+      table_offsets.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),        \
+      indices.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),              \
+      offsets.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),              \
+      optimizer_state.packed_accessor32<acc_type<scalar_t, true>, 1,           \
+                                        RestrictPtrTraits>(),                  \
+      static_cast<int32_t>(L_max), (functor))
+
   AT_DISPATCH_FLOATING_TYPES_AND_HALF(
       weights.type(), "batched_embedding_backward_adagrad_approx_kernel", ([&] {
-        const dim3 threads(kWarpSize, BT_block_size);
-        const dim3 blocks((B * T) / BT_block_size);
         if (!stochastic_rounding) {
-          batched_embedding_backward_adagrad_approx_kernel_1<
-              scalar_t><<<blocks, threads, BT_block_size * L_max *
-                                               sizeof(acc_type<scalar_t, true>),
-                          at::cuda::getCurrentCUDAStream()>>>(
-              grad_output.packed_accessor32<scalar_t, 3, RestrictPtrTraits>(),
-              weights.packed_accessor64<scalar_t, 2, RestrictPtrTraits>(),
-              table_offsets.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
-              indices.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
-              offsets.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
-              optimizer_state.packed_accessor32<acc_type<scalar_t, true>, 1,
-                                                RestrictPtrTraits>(),
-              static_cast<int32_t>(L_max),
-              AdaGradFunctor<scalar_t, false>(learning_rate, eps));
+          if (indice_weights) {
+            auto f = WeightedAdaGradFunctor<scalar_t, false>(
+                learning_rate, eps,
+                indice_weights
+                    ->packed_accessor32<scalar_t, 1, RestrictPtrTraits>(),
+                grad_indice_weights
+                    ->packed_accessor32<scalar_t, 1, RestrictPtrTraits>());
+            X(f);
+          } else {
+            auto f = AdaGradFunctor<scalar_t, false>(learning_rate, eps);
+            X(f);
+          }
         } else {
           std::pair<uint64_t, uint64_t> rng_engine_inputs;
           {
@@ -681,24 +767,27 @@ void batched_embedding_backward_adagrad_approx_cuda(
             rng_engine_inputs = gen->philox_engine_inputs(
                 L_max * ((D + kWarpSize - 1) / kWarpSize));
           }
-          batched_embedding_backward_adagrad_approx_kernel_1<
-              scalar_t><<<blocks, threads, BT_block_size * L_max *
-                                               sizeof(acc_type<scalar_t, true>),
-                          at::cuda::getCurrentCUDAStream()>>>(
-              grad_output.packed_accessor32<scalar_t, 3, RestrictPtrTraits>(),
-              weights.packed_accessor64<scalar_t, 2, RestrictPtrTraits>(),
-              table_offsets.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
-              indices.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
-              offsets.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
-              optimizer_state.packed_accessor32<acc_type<scalar_t, true>, 1,
-                                                RestrictPtrTraits>(),
-              static_cast<int32_t>(L_max),
-              StochasticRoundingAdaGradFunctor<scalar_t, false>(
-                  learning_rate, eps, rng_engine_inputs));
+          if (indice_weights) {
+            auto f = StochasticRoundingWeightedAdaGradFunctor<scalar_t, false>(
+                learning_rate, eps,
+                indice_weights
+                    ->packed_accessor32<scalar_t, 1, RestrictPtrTraits>(),
+                grad_indice_weights
+                    ->packed_accessor32<scalar_t, 1, RestrictPtrTraits>(),
+                rng_engine_inputs);
+            X(f);
+          } else {
+            auto f = StochasticRoundingAdaGradFunctor<scalar_t, false>(
+                learning_rate, eps, rng_engine_inputs);
+            X(f);
+          }
         }
       }));
   AT_CUDA_CHECK(cudaGetLastError());
-  return;
+
+#undef X
+
+  return grad_indice_weights;
 }
 
 static void CUDAManagedDeleter(void *ptr) { AT_CUDA_CHECK(cudaFree(ptr)); }
@@ -731,7 +820,10 @@ struct CUDAHostMappedAllocator final : public at::Allocator {
     void *ptr;
     AT_CUDA_CHECK(cudaHostAlloc(&ptr, size, cudaHostAllocWriteCombined |
                                                 cudaHostAllocMapped));
-    return {ptr,
+
+    void *dev_ptr;
+    AT_CUDA_CHECK(cudaHostGetDevicePointer(&dev_ptr, ptr, 0));
+    return {dev_ptr,
             ptr,
             &CUDAHostMappedDeleter,
             {at::DeviceType::CUDA, at::cuda::current_device()}};
