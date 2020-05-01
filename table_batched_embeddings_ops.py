@@ -130,7 +130,6 @@ class TableBatchedEmbeddingBags(nn.Module):
         managed=EmbeddingLocation.DEVICE,
     ):
         import table_batched_embeddings
-
         super(TableBatchedEmbeddingBags, self).__init__()
         assert managed in (EmbeddingLocation.DEVICE, EmbeddingLocation.HOST_MAPPED)
         if managed == EmbeddingLocation.DEVICE:
@@ -186,8 +185,6 @@ class TableBatchedEmbeddingBags(nn.Module):
         )
 
 
-
-
 class MixedDimLookupFunction(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -223,7 +220,7 @@ class MixedDimLookupFunction(torch.autograd.Function):
             per_sample_weights,
             optimizer_state,
         )
-        BT_block_size = 1 # TODO - fix this.
+        BT_block_size = 1  # TODO - fix this.
         L_max = 200  # TODO: pass this in correctly.
         return table_batched_embeddings.forward_mixed_D(
             weights,
@@ -241,6 +238,7 @@ class MixedDimLookupFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         import table_batched_embeddings
+
         (
             weights,
             table_offsets,
@@ -272,13 +270,13 @@ class MixedDimLookupFunction(torch.autograd.Function):
             BT_block_size,
         )
         return (
-            torch.cuda.sparse.FloatTensor(*weights.size()), # weights
-            None, # table_offsets
-            None, # table_dim_offsets
-            None, # dim_offsets
-            None, # total_D,
-            None, # indices
-            None, # offsets
+            torch.cuda.sparse.FloatTensor(*weights.size()),  # weights
+            None,  # table_offsets
+            None,  # table_dim_offsets
+            None,  # dim_offsets
+            None,  # total_D,
+            None,  # indices
+            None,  # offsets
             grad_per_sample_weight,
             None,
             None,
@@ -286,6 +284,7 @@ class MixedDimLookupFunction(torch.autograd.Function):
             None,
             None,
         )
+
 
 class MixedDimTableBatchedEmbeddingBags(nn.Module):
     def __init__(
@@ -322,26 +321,17 @@ class MixedDimTableBatchedEmbeddingBags(nn.Module):
         T = len(embeddings)
         self.embedding_weights = nn.Parameter(embedding_data)
         self.register_buffer(
-            "table_dim_offsets",
-            torch.tensor(
-                [0]
-                + np.cumsum(rows).tolist()
-            ).int(),
+            "table_dim_offsets", torch.tensor([0] + np.cumsum(rows).tolist()).int(),
         )
         self.register_buffer(
             "table_offsets",
             torch.tensor(
-                [0]
-                + np.cumsum([r * d for r, d in zip(rows, dims)]).tolist()
-            ).long()
+                [0] + np.cumsum([r * d for r, d in zip(rows, dims)]).tolist()
+            ).long(),
         )
         self.register_buffer(
-            "dim_offsets",
-            torch.tensor(
-                [0]
-                + np.cumsum(dims).tolist()
-            ).int(),
-        )        
+            "dim_offsets", torch.tensor([0] + np.cumsum(dims).tolist()).int(),
+        )
 
         # TODO: unused by SGD
         self.register_buffer(
@@ -374,30 +364,37 @@ class MixedDimTableBatchedEmbeddingBags(nn.Module):
 
     def split_embedding_weights(self):
         """
-        Returns a list of weights by table 
+        Returns a list of weights, split by table 
         """
         T = self.table_offsets.size(0) - 1
         return [
-            self.embedding_weights.detach()[self.table_offsets[i]:self.table_offsets[i+1]].view(
-                self.table_dim_offsets[i+1] - self.table_dim_offsets[i], self.dim_offsets[i+1] - self.dim_offsets[i]
-            ) for i in range(T)
+            self.embedding_weights.detach()[
+                self.table_offsets[i] : self.table_offsets[i + 1]
+            ].view(
+                self.table_dim_offsets[i + 1] - self.table_dim_offsets[i],
+                self.dim_offsets[i + 1] - self.dim_offsets[i],
+            )
+            for i in range(T)
         ]
-
 
     def split_optimizer_state(self):
         """
-        Returns a list of weights by table 
+        Returns a list of optimizer states, split by table
         """
         T = self.table_offsets.size(0) - 1
         return [
-            self.optimizer_state.detach()[self.table_dim_offsets[i]:self.table_dim_offsets[i+1]] for i in range(T)
+            self.optimizer_state.detach()[
+                self.table_dim_offsets[i] : self.table_dim_offsets[i + 1]
+            ]
+            for i in range(T)
         ]
 
     def split_output(self, output):
         """
-        Returns a list of outputs
+        Returns a list of outputs, split by table.
         """
-        T = self.table_offsets.size(0)
+        T = self.table_offsets.size(0) - 1
         return [
-            output[:, self.dim_offsets[i]:self.dim_offsets[i+1]] for i in range(T)
-        ]        
+            output[:, self.dim_offsets[i] : self.dim_offsets[i + 1]] for i in range(T)
+        ]
+

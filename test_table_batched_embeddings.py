@@ -402,10 +402,7 @@ def test_backward_adagrad_mixed(
                 bs[t].weight.float(),
                 value=-lr,
                 tensor1=bs[t].weight.grad.float().to_dense(),
-                tensor2=cc.split_optimizer_state()[t]
-                .sqrt_()
-                .add_(eps)
-                .view(-1, 1),
+                tensor2=cc.split_optimizer_state()[t].sqrt_().add_(eps).view(-1, 1),
             ),
             atol=1.0e-3 if fp16 else 1.0e-4,
             rtol=1.0e-3 if fp16 else 1.0e-4,
@@ -413,14 +410,18 @@ def test_backward_adagrad_mixed(
 
     if weighted:
         D_gradcheck = D_gradcheck * 4
-        cc = table_batched_embeddings_ops.MixedDimTableBatchedEmbeddingBags(
-            [(E, D_gradcheck) for (E, D) in zip(Es, Ds)],
-            optimizer=table_batched_embeddings_ops.Optimizer.APPROX_ROWWISE_ADAGRAD,
-            learning_rate=0.0,
-            eps=eps,
-            fp16=fp16,
-            stochastic_rounding=stochastic_rounding,
-        ).cuda().double()
+        cc = (
+            table_batched_embeddings_ops.MixedDimTableBatchedEmbeddingBags(
+                [(E, D_gradcheck) for (E, D) in zip(Es, Ds)],
+                optimizer=table_batched_embeddings_ops.Optimizer.APPROX_ROWWISE_ADAGRAD,
+                learning_rate=0.0,
+                eps=eps,
+                fp16=fp16,
+                stochastic_rounding=stochastic_rounding,
+            )
+            .cuda()
+            .double()
+        )
 
         per_sample_weights = xw.contiguous().view(-1).cuda().double()
         per_sample_weights.requires_grad = True

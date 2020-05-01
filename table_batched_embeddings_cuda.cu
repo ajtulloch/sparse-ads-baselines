@@ -1025,11 +1025,10 @@ __global__ void batched_embedding_backward_adagrad_approx_kernel_mixed_D_1(
   int32_t b_t = blockIdx.x * blockDim.y + threadIdx.y;
   int32_t b = b_t % B;
   int32_t t = b_t / B;
-  
+
   const int32_t dim_start = dim_offsets[t];
   const int32_t dim_end = dim_offsets[t + 1];
   const int32_t D = dim_end - dim_start;
-
 
   acc_type<scalar_t, true> g_local_sum_square = 0;
   for (int32_t d = threadIdx.x; d * 4 < D; d += blockDim.x) {
@@ -1073,8 +1072,8 @@ __global__ void batched_embedding_backward_adagrad_approx_kernel_mixed_D_1(
 
 c10::optional<Tensor> batched_embedding_backward_adagrad_approx_mixed_D_cuda(
     Tensor grad_output, Tensor weights, Tensor table_offsets,
-    Tensor table_dim_offsets, Tensor dim_offsets, int64_t total_D, Tensor indices,
-    Tensor offsets, c10::optional<Tensor> indice_weights,
+    Tensor table_dim_offsets, Tensor dim_offsets, int64_t total_D,
+    Tensor indices, Tensor offsets, c10::optional<Tensor> indice_weights,
     Tensor optimizer_state, float learning_rate, float eps, int64_t L_max,
     bool stochastic_rounding, int64_t BT_block_size) {
   at::cuda::OptionalCUDAGuard device_guard;
