@@ -662,7 +662,6 @@ __global__ void batched_embedding_backward_adagrad_approx_kernel_1(
   int32_t b_t = blockIdx.x * blockDim.y + threadIdx.y;
   int32_t b = b_t % B;
   int32_t t = b_t / B;
-  // assume valid.
 
   acc_type<scalar_t, true> g_local_sum_square = 0;
   for (int32_t d = threadIdx.x; d * 4 < D; d += blockDim.x) {
@@ -875,4 +874,287 @@ Tensor new_host_mapped_tensor(Tensor self, std::vector<std::int64_t> sizes) {
                          /*resizable=*/false);
   auto tensor = at::empty({0}, self.options()).set_(storage, 0, sizes, strides);
   return tensor;
+}
+
+template <typename scalar_t, bool shared_indices, typename F>
+__global__ void batched_embedding_forward_kernel_mixed_D_1(
+    // [\sum_t E_t x D_t]
+    const PackedTensorAccessor64<scalar_t, 1, RestrictPtrTraits> weights,
+    const PackedTensorAccessor32<int64_t, 1, RestrictPtrTraits>
+        table_offsets, // [T]
+    const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits>
+        dim_offsets, // [T+1]
+    const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits>
+        indices, // [N = \sum_{b,t} L_{b,t} total indices, i.e. flattened
+                 // [B][T][L]
+    const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits>
+        offsets, // [B x T + 1]
+    // offsets = cumsum([0] + lengths.contiguous()), where lengths L is [B][T].
+    PackedTensorAccessor32<scalar_t, 2, RestrictPtrTraits>
+        output, // [B][\sum_t D_t],
+    int32_t L_max,
+    F f) {
+
+  extern __shared__ int32_t shmem_indices[];
+  const int32_t T = table_offsets.size(0) - 1;
+  const int32_t B = (offsets.size(0) - 1) / T;
+
+  int32_t b_t = blockIdx.x * blockDim.y + threadIdx.y;
+  int32_t t = b_t / B;
+  int32_t b = b_t % B;
+  const int32_t dim_start = dim_offsets[t];
+  const int32_t dim_end = dim_offsets[t + 1];
+  const int32_t D = dim_end - dim_start;
+
+  const int64_t table_offset = table_offsets[t];
+  const int32_t indices_start = offsets[b * T + t];
+  const int32_t indices_end = offsets[b * T + t + 1];
+  int32_t L = indices_end - indices_start;
+
+  if (shared_indices) {
+    int32_t shmem_offset = threadIdx.y * L_max;
+    for (int32_t i = threadIdx.x; i < L; i += blockDim.x) {
+      shmem_indices[shmem_offset + i] = __ldg(&indices[indices_start + i]);
+    }
+    __syncthreads();
+    for (int32_t d = threadIdx.x; d * 4 < D; d += blockDim.x) {
+      Vec4T<scalar_t> sum;
+      for (int32_t l = 0; l < L; ++l) {
+        auto idx = shmem_indices[shmem_offset + l];
+        Vec4T<scalar_t> weight((&weights[0]) + table_offset + idx * D + d * 4);
+        f.accumulate(sum, weight, indices_start + l);
+      }
+      sum.store((&output[b][0]) + dim_start + d * 4);
+    }
+  } else {
+    for (int32_t d = threadIdx.x; d * 4 < D; d += blockDim.x) {
+      Vec4T<scalar_t> sum;
+      for (int32_t l = 0; l < L; ++l) {
+        auto idx = __ldg(&indices[indices_start + l]);
+        Vec4T<scalar_t> weight((&weights[0]) + table_offset + idx * D + d * 4);
+        f.accumulate(sum, weight, indices_start + l);
+      }
+      sum.store((&output[b][0]) + dim_start + d * 4);
+    }
+  }
+}
+
+Tensor batched_embedding_forward_mixed_D_cuda(
+    Tensor weights, Tensor table_offsets, Tensor dim_offsets, int64_t total_D,
+    Tensor indices, Tensor offsets, c10::optional<Tensor> indice_weights,
+    int64_t L_max, int64_t BT_block_size, bool shmem) {
+  at::cuda::OptionalCUDAGuard device_guard;
+  device_guard.set_index(weights.get_device());
+
+  const auto T = table_offsets.size(0) - 1;
+  AT_ASSERT(T > 0);
+  // offsets = [B x T  + 1]
+  const auto B = (offsets.size(0) - 1) / T;
+  AT_ASSERT(B > 0);
+  AT_ASSERT(BT_block_size != 0);
+  if ((B * T) % BT_block_size != 0) {
+    BT_block_size = 1;
+  }
+  AT_ASSERT((B * T) % BT_block_size == 0);
+  const dim3 threads(kMaxThreads / BT_block_size, BT_block_size);
+  const dim3 blocks((B * T) / BT_block_size);
+
+#define X(shmem_param, shmem_size, functor)                                    \
+  batched_embedding_forward_kernel_mixed_D_1<scalar_t, (shmem_param)><<<       \
+      blocks, threads, (shmem_size), at::cuda::getCurrentCUDAStream()>>>(      \
+      weights.packed_accessor64<scalar_t, 1, RestrictPtrTraits>(),             \
+      table_offsets.packed_accessor32<int64_t, 1, RestrictPtrTraits>(),        \
+      dim_offsets.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),          \
+      indices.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),              \
+      offsets.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),              \
+      output.packed_accessor32<scalar_t, 2, RestrictPtrTraits>(),              \
+      static_cast<int32_t>(L_max), (functor))
+
+  auto output = empty({B, total_D}, weights.options());
+  AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+      weights.type(), "batched_embedding_forward_kernel", ([&] {
+        if (shmem) {
+          if (indice_weights) {
+            X(true, BT_block_size * L_max * sizeof(int32_t),
+              WeightedForward<scalar_t>(
+                  indice_weights
+                      ->packed_accessor32<scalar_t, 1, RestrictPtrTraits>()));
+          } else {
+            X(true, BT_block_size * L_max * sizeof(int32_t),
+              UnweightedForward<scalar_t>());
+          }
+        } else {
+          if (indice_weights) {
+            X(false, 0,
+              WeightedForward<scalar_t>(
+                  indice_weights
+                      ->packed_accessor32<scalar_t, 1, RestrictPtrTraits>()));
+          } else {
+            X(false, 0, UnweightedForward<scalar_t>());
+          }
+        }
+      }));
+
+#undef X
+  AT_CUDA_CHECK(cudaGetLastError());
+  return output;
+}
+
+template <typename scalar_t, typename F>
+__global__ void batched_embedding_backward_adagrad_approx_kernel_mixed_D_1(
+    const PackedTensorAccessor32<scalar_t, 2, RestrictPtrTraits> grad_output,
+    PackedTensorAccessor64<scalar_t, 1, RestrictPtrTraits> weights,
+    const PackedTensorAccessor32<int64_t, 1, RestrictPtrTraits> table_offsets,
+    const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits>
+        table_dim_offsets, // [T]
+    const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits>
+        dim_offsets, // [T+1]
+
+    const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits>
+        indices,
+    const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits> offsets,
+    PackedTensorAccessor32<acc_type<scalar_t, true>, 1, RestrictPtrTraits>
+        optimizer_state,
+    int32_t L_max, F f) {
+  extern __shared__ int32_t shmem[];
+  auto *shmem_multipliers = (acc_type<scalar_t, true> *)(&shmem[0]);
+  const int32_t T = table_offsets.size(0) - 1;
+  const int32_t B = (offsets.size(0) - 1) / T;
+
+  // do warp-per-D (so only need warp reduction)
+  int32_t b_t = blockIdx.x * blockDim.y + threadIdx.y;
+  int32_t b = b_t % B;
+  int32_t t = b_t / B;
+  
+  const int32_t dim_start = dim_offsets[t];
+  const int32_t dim_end = dim_offsets[t + 1];
+  const int32_t D = dim_end - dim_start;
+
+
+  acc_type<scalar_t, true> g_local_sum_square = 0;
+  for (int32_t d = threadIdx.x; d * 4 < D; d += blockDim.x) {
+    Vec4T<scalar_t> g(&grad_output[b][0] + dim_start + d * 4);
+    g_local_sum_square += g.acc.x * g.acc.x + g.acc.y * g.acc.y +
+                          g.acc.z * g.acc.z + g.acc.w * g.acc.w;
+  }
+  const acc_type<scalar_t, true> g_sum_square =
+      warpReduceAllSum<acc_type<scalar_t, true>>(g_local_sum_square);
+
+  const int32_t table_dim_offset = table_dim_offsets[t];
+
+  const int64_t table_offset = table_offsets[t];
+  const int32_t indices_start = offsets[b * T + t];
+  const int32_t indices_end = offsets[b * T + t + 1];
+  int32_t L = indices_end - indices_start;
+
+  auto state = f.init_update(blockIdx.x * blockDim.x * blockDim.y +
+                             threadIdx.y * blockDim.x + threadIdx.x);
+  for (int32_t i = threadIdx.x; i < L; i += blockDim.x) {
+    auto idx = __ldg(&indices[indices_start + i]);
+    shmem_multipliers[threadIdx.y * L_max + i] = f.update_momentum(
+        g_sum_square, &optimizer_state[table_dim_offset + idx],
+        indices_start + i);
+  }
+  __syncthreads();
+  for (int32_t l = 0; l < L; ++l) {
+    auto idx = indices[indices_start + l];
+    acc_type<scalar_t, true> multiplier =
+        shmem_multipliers[threadIdx.y * L_max + l];
+
+    auto sample_weight_state = f.init_sample_weight(indices_start + l);
+    for (int32_t d = threadIdx.x; d * 4 < D; d += blockDim.x) {
+      Vec4T<scalar_t> grad_out(&grad_output[b][0] + dim_start + d * 4);
+      f.update_weight((&weights[0]) + table_offset + idx * D + d * 4,
+                      multiplier, grad_out, state, sample_weight_state);
+    }
+    f.update_sample_weight(sample_weight_state, indices_start + l);
+  }
+}
+
+c10::optional<Tensor> batched_embedding_backward_adagrad_approx_mixed_D_cuda(
+    Tensor grad_output, Tensor weights, Tensor table_offsets,
+    Tensor table_dim_offsets, Tensor dim_offsets, int64_t total_D, Tensor indices,
+    Tensor offsets, c10::optional<Tensor> indice_weights,
+    Tensor optimizer_state, float learning_rate, float eps, int64_t L_max,
+    bool stochastic_rounding, int64_t BT_block_size) {
+  at::cuda::OptionalCUDAGuard device_guard;
+  device_guard.set_index(weights.get_device());
+
+  const auto T = table_offsets.size(0) - 1;
+  AT_ASSERT(T > 0);
+  // offsets = [B x T  + 1]
+  const auto B = (offsets.size(0) - 1) / T;
+  AT_ASSERT(B > 0);
+  AT_ASSERT(BT_block_size > 0);
+  if ((B * T) % BT_block_size != 0) {
+    BT_block_size = 1;
+  }
+  AT_ASSERT(BT_block_size * kWarpSize <= kMaxThreads);
+  const dim3 threads(kWarpSize, BT_block_size);
+  const dim3 blocks((B * T) / BT_block_size);
+  c10::optional<Tensor> grad_indice_weights = c10::nullopt;
+  if (indice_weights) {
+    grad_indice_weights = at::empty(indices.sizes(), grad_output.options());
+  }
+
+#define X(functor)                                                             \
+  batched_embedding_backward_adagrad_approx_kernel_mixed_D_1<                  \
+      scalar_t><<<blocks, threads,                                             \
+                  BT_block_size * L_max * sizeof(acc_type<scalar_t, true>),    \
+                  at::cuda::getCurrentCUDAStream()>>>(                         \
+      grad_output.packed_accessor32<scalar_t, 2, RestrictPtrTraits>(),         \
+      weights.packed_accessor64<scalar_t, 1, RestrictPtrTraits>(),             \
+      table_offsets.packed_accessor32<int64_t, 1, RestrictPtrTraits>(),        \
+      table_dim_offsets.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),    \
+      dim_offsets.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),          \
+      indices.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),              \
+      offsets.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),              \
+      optimizer_state.packed_accessor32<acc_type<scalar_t, true>, 1,           \
+                                        RestrictPtrTraits>(),                  \
+      static_cast<int32_t>(L_max), (functor))
+
+  AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+      weights.type(), "batched_embedding_backward_adagrad_approx_kernel", ([&] {
+        if (!stochastic_rounding) {
+          if (indice_weights) {
+            auto f = WeightedAdaGradFunctor<scalar_t, false>(
+                learning_rate, eps,
+                indice_weights
+                    ->packed_accessor32<scalar_t, 1, RestrictPtrTraits>(),
+                grad_indice_weights
+                    ->packed_accessor32<scalar_t, 1, RestrictPtrTraits>());
+            X(f);
+          } else {
+            auto f = AdaGradFunctor<scalar_t, false>(learning_rate, eps);
+            X(f);
+          }
+        } else {
+          std::pair<uint64_t, uint64_t> rng_engine_inputs;
+          {
+            auto gen = at::cuda::detail::getDefaultCUDAGenerator();
+            std::lock_guard<std::mutex> lock(gen->mutex_);
+            rng_engine_inputs = gen->philox_engine_inputs(
+                L_max * ((total_D + kWarpSize - 1) / kWarpSize));
+          }
+          if (indice_weights) {
+            auto f = StochasticRoundingWeightedAdaGradFunctor<scalar_t, false>(
+                learning_rate, eps,
+                indice_weights
+                    ->packed_accessor32<scalar_t, 1, RestrictPtrTraits>(),
+                grad_indice_weights
+                    ->packed_accessor32<scalar_t, 1, RestrictPtrTraits>(),
+                rng_engine_inputs);
+            X(f);
+          } else {
+            auto f = StochasticRoundingAdaGradFunctor<scalar_t, false>(
+                learning_rate, eps, rng_engine_inputs);
+            X(f);
+          }
+        }
+      }));
+  AT_CUDA_CHECK(cudaGetLastError());
+
+#undef X
+
+  return grad_indice_weights;
 }
