@@ -196,10 +196,10 @@ __global__ void batched_embedding_forward_kernel_1(
         table_offsets, // [T]
     const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits>
         indices, // [N = \sum_{b,t} L_{b,t} total indices, i.e. flattened
-                 // [B][T][L]
+                 // [T][B][L]
     const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits>
-        offsets, // [B x T + 1]
-    // offsets = cumsum([0] + lengths.contiguous()), where lengths L is [B][T].
+        offsets, // [T x B + 1]
+    // offsets = cumsum([0] + lengths.contiguous()), where lengths L is [T][.
     PackedTensorAccessor32<scalar_t, 3, RestrictPtrTraits>
         output, // [B][T][D],
     int32_t L_max,
@@ -216,8 +216,8 @@ __global__ void batched_embedding_forward_kernel_1(
   int32_t b = b_t % B;
 
   const int32_t table_offset = table_offsets[t];
-  const int32_t indices_start = offsets[b * T + t];
-  const int32_t indices_end = offsets[b * T + t + 1];
+  const int32_t indices_start = offsets[t * B + b];
+  const int32_t indices_end = offsets[t * B + b + 1];
   int32_t L = indices_end - indices_start;
 
   if (shared_indices) {
@@ -348,8 +348,8 @@ __global__ void batched_embedding_backward_sgd_kernel_1(
   int32_t t = b_t / B;
 
   const int32_t table_offset = table_offsets[t];
-  const int32_t indices_start = offsets[b * T + t];
-  const int32_t indices_end = offsets[b * T + t + 1];
+  const int32_t indices_start = offsets[t * B + b];
+  const int32_t indices_end = offsets[t * B + b + 1];
   int32_t L = indices_end - indices_start;
 
   if (shared_mem) {
@@ -673,8 +673,8 @@ __global__ void batched_embedding_backward_adagrad_approx_kernel_1(
       warpReduceAllSum<acc_type<scalar_t, true>>(g_local_sum_square);
 
   const int32_t table_offset = table_offsets[t];
-  const int32_t indices_start = offsets[b * T + t];
-  const int32_t indices_end = offsets[b * T + t + 1];
+  const int32_t indices_start = offsets[t * B + b];
+  const int32_t indices_end = offsets[t * B + b + 1];
   int32_t L = indices_end - indices_start;
 
   auto state = f.init_update(blockIdx.x * blockDim.x * blockDim.y +
@@ -907,8 +907,8 @@ __global__ void batched_embedding_forward_kernel_mixed_D_1(
   const int32_t D = dim_end - dim_start;
 
   const int64_t table_offset = table_offsets[t];
-  const int32_t indices_start = offsets[b * T + t];
-  const int32_t indices_end = offsets[b * T + t + 1];
+  const int32_t indices_start = offsets[t * B + b];
+  const int32_t indices_end = offsets[t * B + b + 1];
   int32_t L = indices_end - indices_start;
 
   if (shared_indices) {
@@ -1042,8 +1042,8 @@ __global__ void batched_embedding_backward_adagrad_approx_kernel_mixed_D_1(
   const int32_t table_dim_offset = table_dim_offsets[t];
 
   const int64_t table_offset = table_offsets[t];
-  const int32_t indices_start = offsets[b * T + t];
-  const int32_t indices_end = offsets[b * T + t + 1];
+  const int32_t indices_start = offsets[t * B + b];
+  const int32_t indices_end = offsets[t * B + b + 1];
   int32_t L = indices_end - indices_start;
 
   auto state = f.init_update(blockIdx.x * blockDim.x * blockDim.y +
@@ -1093,7 +1093,8 @@ c10::optional<Tensor> batched_embedding_backward_adagrad_approx_mixed_D_cuda(
   const dim3 blocks((B * T) / BT_block_size);
   c10::optional<Tensor> grad_indice_weights = c10::nullopt;
   if (indice_weights) {
-    grad_indice_weights = at::empty(indices.sizes(), grad_output.options());
+    grad_indice_weights =
+        at::empty(indice_weights->sizes(), grad_output.options());
   }
 
 #define X(functor)                                                             \
@@ -1156,4 +1157,54 @@ c10::optional<Tensor> batched_embedding_backward_adagrad_approx_mixed_D_cuda(
 #undef X
 
   return grad_indice_weights;
+}
+
+__global__ void construct_offsets_kernel(
+    const PackedTensorAccessor32<int32_t, 2, RestrictPtrTraits>
+        batch_offsets_per_table,
+    const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits>
+        total_indices_per_table,
+    PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits> output) {
+  const int32_t T = batch_offsets_per_table.size(0);
+  const int32_t B = batch_offsets_per_table.size(1);
+
+  // do warp-per-D (so only need warp reduction)
+  int32_t b_t = blockIdx.x * blockDim.x + threadIdx.x;
+  int32_t b = b_t % B;
+  int32_t t = b_t / B;
+  if (t < T) {
+    int32_t upper = 0;
+    if (b != B - 1) {
+      upper = batch_offsets_per_table[t][b + 1];
+    } else {
+      upper = total_indices_per_table[t];
+    }
+    int32_t lower = batch_offsets_per_table[t][b];
+    output[1 + t * B + b] = upper - lower;
+  }
+}
+
+Tensor construct_offsets(Tensor batch_offsets_per_table, // [T][B]
+                         Tensor total_indices_per_table  // [T]
+                         ) {
+  at::cuda::OptionalCUDAGuard device_guard;
+  device_guard.set_index(batch_offsets_per_table.get_device());
+
+  const auto T = batch_offsets_per_table.size(0);
+  const auto B = batch_offsets_per_table.size(1);
+  const dim3 threads(kMaxThreads);
+  const dim3 blocks((B * T + 1 + kMaxThreads - 1) / kMaxThreads);
+
+  Tensor output =
+      at::zeros({1 + B * T}, batch_offsets_per_table.options().dtype(kInt));
+
+  construct_offsets_kernel<<<blocks, threads, 0,
+                             at::cuda::getCurrentCUDAStream()>>>(
+      batch_offsets_per_table
+          .packed_accessor32<int32_t, 2, RestrictPtrTraits>(),
+      total_indices_per_table
+          .packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
+      output.packed_accessor32<int32_t, 1, RestrictPtrTraits>());
+  AT_CUDA_CHECK(cudaGetLastError());
+  return output;
 }

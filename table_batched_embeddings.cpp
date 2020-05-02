@@ -35,6 +35,10 @@ Tensor batched_embedding_forward_mixed_D_cuda(
     Tensor indices, Tensor offsets, c10::optional<Tensor> indice_weights,
     int64_t L_max, int64_t BT_block_size, bool shmem);
 
+Tensor construct_offsets(Tensor batch_offsets_per_table, // [T][B]
+                         Tensor total_indices_per_table  // [T]
+                         );
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
   m.def("forward", &batched_embedding_forward_cuda);
@@ -42,7 +46,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
   m.def("backward_approx_adagrad", &batched_embedding_backward_adagrad_approx_cuda);
   m.def("backward_approx_adagrad_mixed_D", &batched_embedding_backward_adagrad_approx_mixed_D_cuda);
   m.def("forward_mixed_D", &batched_embedding_forward_mixed_D_cuda);
-
+  m.def("construct_offsets", &construct_offsets);
   m.def("new_managed_tensor", &new_managed_tensor);
   m.def("new_host_mapped_tensor", &new_host_mapped_tensor);
 }

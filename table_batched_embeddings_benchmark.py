@@ -15,8 +15,8 @@ def div_round_up(a, b):
 
 
 def get_table_batched_offsets_from_dense(merged_indices):
-    (B, T, L) = merged_indices.size()
-    lengths = np.ones((B, T)) * L
+    (T, B, L) = merged_indices.size()
+    lengths = np.ones((T, B)) * L
     flat_lengths = lengths.flatten()
     return (
         merged_indices.int().contiguous().view(-1).cuda(),
@@ -105,7 +105,7 @@ def benchmark_forward(B, E, T, L, D, iters, fp16, managed, mixed):
             c(g, w, o, a, b, d, x.random_(0, E - 1), *args)
 
         return z
-    merged_indices = torch.randint(low=0, high=E - 1, size=(B, T, L)).int().cuda()
+    merged_indices = torch.randint(low=0, high=E - 1, size=(T, B, L)).int().cuda()
     (indices, offsets) = get_table_batched_offsets_from_dense(merged_indices)
     assert indices.shape[0] == B * T * L
     assert all(

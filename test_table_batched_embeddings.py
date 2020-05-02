@@ -21,8 +21,8 @@ def get_offsets_from_dense(indices):
 
 
 def get_table_batched_offsets_from_dense(merged_indices):
-    (B, T, L) = merged_indices.size()
-    lengths = np.ones((B, T)) * L
+    (T, B, L) = merged_indices.size()
+    lengths = np.ones((T, B)) * L
     flat_lengths = lengths.flatten()
     return (
         merged_indices.int().contiguous().view(-1).cuda(),
@@ -66,8 +66,8 @@ def test_forward(T, D, B, L, fp16, weighted):
 
     for t in range(T):
         cc.embedding_weights.data.view(T, E, D)[t, :, :] = bs[t].weight
-    x = torch.cat([x.view(B, 1, L) for x in xs], dim=1)
-    xw = torch.cat([xw.view(B, 1, L) for xw in xws], dim=1)
+    x = torch.cat([x.view(1, B, L) for x in xs], dim=0)
+    xw = torch.cat([xw.view(1, B, L) for xw in xws], dim=0)
 
     (indices, offsets) = get_table_batched_offsets_from_dense(x)
     fc2 = (
@@ -124,7 +124,7 @@ def test_backward_sgd(T, D, B, L, fp16):
     for t in range(T):
         cc.embedding_weights.data.view(T, E, D)[t, :, :] = bs[t].weight
 
-    x = torch.cat([x.view(B, 1, L) for x in xs], dim=1)
+    x = torch.cat([x.view(1, B, L) for x in xs], dim=0)
     (indices, offsets) = get_table_batched_offsets_from_dense(x)
     fc2 = cc(indices, offsets)
     fc2.backward(torch.cat([go.view(B, 1, D) for go in gos], dim=1))
@@ -197,8 +197,8 @@ def test_backward_adagrad(T, D, B, L, D_gradcheck, fp16, stochastic_rounding, we
     for t in range(T):
         cc.embedding_weights.data.view(T, E, D)[t, :, :] = bs[t].weight
 
-    x = torch.cat([x.view(B, 1, L) for x in xs], dim=1)
-    xw = torch.cat([xw.view(B, 1, L) for xw in xws], dim=1)
+    x = torch.cat([x.view(1, B, L) for x in xs], dim=0)
+    xw = torch.cat([xw.view(1, B, L) for xw in xws], dim=0)
 
     (indices, offsets) = get_table_batched_offsets_from_dense(x)
     fc2 = (
@@ -295,8 +295,8 @@ def test_forward_mixed(T, D_max, B, L, fp16, weighted):
 
     for t, weights in enumerate(cc.split_embedding_weights()):
         weights[:, :] = bs[t].weight
-    x = torch.cat([x.view(B, 1, L) for x in xs], dim=1)
-    xw = torch.cat([xw.view(B, 1, L) for xw in xws], dim=1)
+    x = torch.cat([x.view(1, B, L) for x in xs], dim=0)
+    xw = torch.cat([xw.view(1, B, L) for xw in xws], dim=0)
 
     (indices, offsets) = get_table_batched_offsets_from_dense(x)
     fc2 = (
@@ -323,7 +323,6 @@ def test_backward_adagrad_mixed(
 ):
     Ds = [np.random.randint(low=1, high=D_max) * 4 for _ in range(T)]
     Es = [np.random.randint(low=int(0.5 * 1e4), high=int(2 * 1.0e4)) for _ in range(T)]
-    print(list(zip(Es, Ds)))
     bs = [
         torch.nn.EmbeddingBag(E, D, mode="sum", sparse=True).cuda()
         for (E, D) in zip(Es, Ds)
@@ -339,7 +338,6 @@ def test_backward_adagrad_mixed(
         for E in Es
     ]
     xws = [torch.randn(size=(B, L)).cuda() for _ in range(T)]
-    # xws = [torch.ones(size=(B, L)).cuda().float() * 2 for _ in range(T)]
 
     if fp16:
         xws = [xw.half() for xw in xws]
@@ -374,8 +372,8 @@ def test_backward_adagrad_mixed(
     for t, weights in enumerate(cc.split_embedding_weights()):
         weights[:, :] = bs[t].weight
 
-    x = torch.cat([x.view(B, 1, L) for x in xs], dim=1)
-    xw = torch.cat([xw.view(B, 1, L) for xw in xws], dim=1)
+    x = torch.cat([x.view(1, B, L) for x in xs], dim=0)
+    xw = torch.cat([xw.view(1, B, L) for xw in xws], dim=0)
 
     (indices, offsets) = get_table_batched_offsets_from_dense(x)
     fc2 = (
