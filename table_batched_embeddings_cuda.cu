@@ -5,6 +5,8 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 
+#include "cub/device/device_radix_sort.cuh"
+
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
@@ -471,6 +473,7 @@ template <typename scalar_t, bool use_atomics> struct AdaGradFunctor {
   DEVICE_INLINE State init_sample_weight(int32_t indices_offset) {
     return State{};
   }
+
   DEVICE_INLINE void update_sample_weight(State &state,
                                           int32_t indices_offset) {
     return;
@@ -1207,4 +1210,497 @@ Tensor construct_offsets(Tensor batch_offsets_per_table, // [T][B]
       output.packed_accessor32<int32_t, 1, RestrictPtrTraits>());
   AT_CUDA_CHECK(cudaGetLastError());
   return output;
+}
+
+struct IndexInfo {
+  int32_t b_t;
+  int32_t indices_idx;
+};
+
+__global__ void linear_index_weight_offsets_mixed_D_kernel(
+    const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits>
+        table_dim_offsets,
+    const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits> indices,
+    const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits> offsets,
+    IndexInfo *__restrict__ infos,
+    PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits> linear_indices) {
+  const int32_t T = table_dim_offsets.size(0) - 1;
+  const int32_t B = (offsets.size(0) - 1) / T;
+
+  int32_t b_t = blockIdx.x * blockDim.y + threadIdx.y;
+  int32_t b = b_t % B;
+  int32_t t = b_t / B;
+
+  const int32_t table_dim_offset = table_dim_offsets[t];
+  const int32_t indices_start = offsets[t * B + b];
+  const int32_t indices_end = offsets[t * B + b + 1];
+  int32_t L = indices_end - indices_start;
+
+  for (int32_t i = threadIdx.x; i < L; i += blockDim.x) {
+    auto idx = __ldg(&indices[indices_start + i]);
+    IndexInfo info;
+    info.b_t = b_t;
+    info.indices_idx = indices_start + i;
+    infos[indices_start + i] = info;
+    linear_indices[indices_start + i] = table_dim_offset + idx;
+  }
+}
+
+template <typename scalar_t, typename F>
+__global__ void batched_embedding_backward_adagrad_exact_kernel_mixed_D_1(
+    const PackedTensorAccessor32<scalar_t, 2, RestrictPtrTraits> grad_output,
+    PackedTensorAccessor64<scalar_t, 1, RestrictPtrTraits> weights,
+    const PackedTensorAccessor32<int64_t, 1, RestrictPtrTraits> table_offsets,
+    const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits>
+        table_dim_offsets, // [T]
+    const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits>
+        dim_offsets, // [T+1]
+
+    const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits>
+        indices,
+    const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits> offsets,
+    PackedTensorAccessor32<acc_type<scalar_t, true>, 1, RestrictPtrTraits>
+        optimizer_state,
+    const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits>
+        sorted_linear_indices,
+    const IndexInfo *__restrict__ infos,
+
+    int32_t indices_numel, F f) {
+  const int32_t T = table_offsets.size(0) - 1;
+  const int32_t B = (offsets.size(0) - 1) / T;
+
+  int32_t sorted_linear_indice_id = blockIdx.x * blockDim.y + threadIdx.y;
+  if (sorted_linear_indice_id >= indices_numel) {
+    // don't have *warp* divergence since we launch full warps in blockDim.x, so
+    // we can just exit this warp entirely.
+    return;
+  }
+
+  // check if this warp is responsible for this whole segment.
+  bool segment_start = (sorted_linear_indice_id == 0 ||
+                        sorted_linear_indices[sorted_linear_indice_id - 1] !=
+                            sorted_linear_indices[sorted_linear_indice_id]);
+
+  if (!segment_start) {
+    // don't have *warp* divergence since we launch full warps in blockDim.x, so
+    // we can just exit this warp entirely.
+    return;
+  }
+
+  int32_t linear_index = sorted_linear_indices[sorted_linear_indice_id];
+  // now, find the end of the segment (and thus the segment length `SL`).
+  int32_t SL = 1;
+  while (sorted_linear_indice_id + SL < indices_numel &&
+         sorted_linear_indices[sorted_linear_indice_id + SL] == linear_index) {
+    SL += 1;
+  }
+  // now, each segment corresponds to exactly one table `t` and row in that
+  // table (`idx`). Thus, we can hoist out some of the book-keeping.
+  auto info_0 = infos[sorted_linear_indice_id];
+  const int32_t t = info_0.b_t / B;
+  const int64_t table_offset = table_offsets[t];
+  const int32_t table_dim_offset = table_dim_offsets[t];
+  const int32_t idx = linear_index - table_dim_offset;
+  const int32_t dim_start = dim_offsets[t];
+  const int32_t dim_end = dim_offsets[t + 1];
+  const int32_t D = dim_end - dim_start;
+
+  acc_type<scalar_t, true> g_local_sum_square = 0;
+  for (int32_t d = threadIdx.x; d * 4 < D; d += blockDim.x) {
+    Vec4T<scalar_t> sum;
+    for (int32_t sl = 0; sl < SL; ++sl) {
+      int32_t b = infos[sorted_linear_indice_id + sl].b_t % B;
+      // TODO: apply per-sample weighting.
+      Vec4T<scalar_t> grad_out(&grad_output[b][0] + dim_start + d * 4);
+      sum.acc.x += grad_out.acc.x;
+      sum.acc.y += grad_out.acc.y;
+      sum.acc.z += grad_out.acc.z;
+      sum.acc.w += grad_out.acc.w;
+    }
+    g_local_sum_square += sum.acc.x * sum.acc.x + sum.acc.y * sum.acc.y +
+                          sum.acc.z * sum.acc.z + sum.acc.w * sum.acc.w;
+  }
+
+  const acc_type<scalar_t, true> g_sum_square =
+      warpReduceAllSum<acc_type<scalar_t, true>>(g_local_sum_square);
+
+  auto state = f.init_update(blockIdx.x * blockDim.x * blockDim.y +
+                             threadIdx.y * blockDim.x + threadIdx.x);
+
+  acc_type<scalar_t, true> multiplier = f.update_momentum(
+      g_sum_square, &optimizer_state[table_dim_offset + idx], -1);
+
+  auto sample_weight_state = f.init_sample_weight(-1);
+  for (int32_t d = threadIdx.x; d * 4 < D; d += blockDim.x) {
+    Vec4T<scalar_t> sum;
+    for (int32_t sl = 0; sl < SL; ++sl) {
+      auto b = infos[sorted_linear_indice_id + sl].b_t % B;
+      Vec4T<scalar_t> grad_out(&grad_output[b][0] + dim_start + d * 4);
+      sum.acc.x += grad_out.acc.x;
+      sum.acc.y += grad_out.acc.y;
+      sum.acc.z += grad_out.acc.z;
+      sum.acc.w += grad_out.acc.w;
+    }
+    f.update_weight((&weights[0]) + table_offset + idx * D + d * 4, multiplier,
+                    sum, state, sample_weight_state);
+  }
+  f.update_sample_weight(sample_weight_state, -1);
+}
+
+c10::optional<Tensor> batched_embedding_backward_adagrad_exact_mixed_D_cuda(
+    Tensor grad_output, Tensor weights, Tensor table_offsets,
+    Tensor table_dim_offsets, Tensor dim_offsets, int64_t total_D,
+    Tensor indices, Tensor offsets, c10::optional<Tensor> indice_weights,
+    Tensor optimizer_state, float learning_rate, float eps,
+    bool stochastic_rounding, int64_t BT_block_size) {
+  at::cuda::OptionalCUDAGuard device_guard;
+  device_guard.set_index(weights.get_device());
+
+  const auto T = table_offsets.size(0) - 1;
+  AT_ASSERT(T > 0);
+  // offsets = [B x T  + 1]
+  const auto B = (offsets.size(0) - 1) / T;
+  AT_ASSERT(B > 0);
+  AT_ASSERT(BT_block_size > 0);
+  if ((B * T) % BT_block_size != 0) {
+    BT_block_size = 1;
+  }
+  AT_ASSERT(BT_block_size * kWarpSize <= kMaxThreads);
+
+  const dim3 threads(kWarpSize, BT_block_size);
+
+  c10::optional<Tensor> grad_indice_weights = c10::nullopt;
+  if (indice_weights) {
+    grad_indice_weights =
+        at::empty(indice_weights->sizes(), grad_output.options());
+  }
+
+  auto infos =
+      at::empty({indices.numel() * static_cast<int64_t>(sizeof(IndexInfo))},
+                indices.options().dtype(kByte));
+
+  auto infos_sorted =
+      at::empty({indices.numel() * static_cast<int64_t>(sizeof(IndexInfo))},
+                indices.options().dtype(kByte));
+
+  auto linear_indices = at::empty_like(indices);
+  auto linear_indices_sorted = at::empty_like(indices);
+
+  linear_index_weight_offsets_mixed_D_kernel<<<
+      dim3((B * T) / BT_block_size), threads, 0,
+      at::cuda::getCurrentCUDAStream()>>>(
+      table_dim_offsets.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
+      indices.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
+      offsets.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
+      (IndexInfo *)infos.data_ptr(),
+      linear_indices.packed_accessor32<int32_t, 1, RestrictPtrTraits>());
+  AT_CUDA_CHECK(cudaGetLastError());
+
+  size_t temp_storage_bytes = 0;
+  AT_CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+      nullptr, temp_storage_bytes, (int32_t *)linear_indices.data_ptr(),
+      (int32_t *)linear_indices_sorted.data_ptr(),
+      (IndexInfo *)infos.data_ptr(), (IndexInfo *)infos_sorted.data_ptr(),
+      linear_indices.numel(), 0, int(log2(optimizer_state.numel()) + 1),
+      at::cuda::getCurrentCUDAStream(), false));
+
+  auto temp_storage = at::empty({static_cast<int64_t>(temp_storage_bytes)},
+                                indices.options().dtype(kByte));
+
+  AT_CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+      temp_storage.data_ptr(), temp_storage_bytes,
+      (int32_t *)linear_indices.data_ptr(),
+      (int32_t *)linear_indices_sorted.data_ptr(),
+      (IndexInfo *)infos.data_ptr(), (IndexInfo *)infos_sorted.data_ptr(),
+      linear_indices.numel(), 0, int(log2(optimizer_state.numel()) + 1),
+      at::cuda::getCurrentCUDAStream(), false));
+
+  const dim3 blocks((linear_indices.numel() + BT_block_size - 1) /
+                    BT_block_size);
+
+#define X(functor)                                                             \
+  batched_embedding_backward_adagrad_exact_kernel_mixed_D_1<                   \
+      scalar_t><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(     \
+      grad_output.packed_accessor32<scalar_t, 2, RestrictPtrTraits>(),         \
+      weights.packed_accessor64<scalar_t, 1, RestrictPtrTraits>(),             \
+      table_offsets.packed_accessor32<int64_t, 1, RestrictPtrTraits>(),        \
+      table_dim_offsets.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),    \
+      dim_offsets.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),          \
+      indices.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),              \
+      offsets.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),              \
+      optimizer_state.packed_accessor32<acc_type<scalar_t, true>, 1,           \
+                                        RestrictPtrTraits>(),                  \
+      linear_indices_sorted                                                    \
+          .packed_accessor32<int32_t, 1, RestrictPtrTraits>(),                 \
+      (const IndexInfo *)infos_sorted.data_ptr(),                              \
+      static_cast<int32_t>(linear_indices_sorted.numel()), (functor))
+
+  AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+      weights.type(), "batched_embedding_backward_adagrad_approx_kernel", ([&] {
+        if (!stochastic_rounding) {
+          if (indice_weights) {
+            AT_ASSERT(false);
+          } else {
+            auto f = AdaGradFunctor<scalar_t, false>(learning_rate, eps);
+            X(f);
+          }
+        } else {
+          std::pair<uint64_t, uint64_t> rng_engine_inputs;
+          {
+            auto gen = at::cuda::detail::getDefaultCUDAGenerator();
+            std::lock_guard<std::mutex> lock(gen->mutex_);
+            rng_engine_inputs = gen->philox_engine_inputs(
+                ((total_D + kWarpSize - 1) / kWarpSize));
+          }
+          if (indice_weights) {
+            AT_ASSERT(false);
+          } else {
+            auto f = StochasticRoundingAdaGradFunctor<scalar_t, false>(
+                learning_rate, eps, rng_engine_inputs);
+            X(f);
+          }
+        }
+      }));
+  AT_CUDA_CHECK(cudaGetLastError());
+
+#undef X
+
+  return grad_indice_weights;
+}
+
+__global__ void linear_index_weight_offsets_kernel(
+    const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits> table_offsets,
+    const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits> indices,
+    const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits> offsets,
+    IndexInfo *__restrict__ infos,
+    PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits> linear_indices) {
+  const int32_t T = table_offsets.size(0);
+  const int32_t B = (offsets.size(0) - 1) / T;
+
+  int32_t b_t = blockIdx.x * blockDim.y + threadIdx.y;
+  int32_t b = b_t % B;
+  int32_t t = b_t / B;
+
+  const int32_t table_offset = table_offsets[t];
+  const int32_t indices_start = offsets[t * B + b];
+  const int32_t indices_end = offsets[t * B + b + 1];
+  int32_t L = indices_end - indices_start;
+
+  for (int32_t i = threadIdx.x; i < L; i += blockDim.x) {
+    auto idx = __ldg(&indices[indices_start + i]);
+    IndexInfo info;
+    info.b_t = b_t;
+    info.indices_idx = indices_start + i;
+    infos[indices_start + i] = info;
+    linear_indices[indices_start + i] = table_offset + idx;
+  }
+}
+
+template <typename scalar_t, typename F>
+__global__ void batched_embedding_backward_adagrad_exact_kernel_1(
+    const PackedTensorAccessor32<scalar_t, 3, RestrictPtrTraits> grad_output,
+    PackedTensorAccessor64<scalar_t, 2, RestrictPtrTraits> weights,
+    const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits> table_offsets,
+    const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits> indices,
+    const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits> offsets,
+    PackedTensorAccessor32<acc_type<scalar_t, true>, 1, RestrictPtrTraits>
+        optimizer_state,
+    const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits>
+        sorted_linear_indices,
+    const IndexInfo *__restrict__ infos, int32_t indices_numel, F f) {
+  const int32_t B = grad_output.size(0);
+  const int32_t T = grad_output.size(1);
+  const int32_t D = grad_output.size(2);
+
+  int32_t sorted_linear_indice_id = blockIdx.x * blockDim.y + threadIdx.y;
+  if (sorted_linear_indice_id >= indices_numel) {
+    // don't have *warp* divergence since we launch full warps in blockDim.x, so
+    // we can just exit this warp entirely.
+    return;
+  }
+
+  // check if this warp is responsible for this whole segment.
+  bool segment_start = (sorted_linear_indice_id == 0 ||
+                        sorted_linear_indices[sorted_linear_indice_id - 1] !=
+                            sorted_linear_indices[sorted_linear_indice_id]);
+
+  if (!segment_start) {
+    // don't have *warp* divergence since we launch full warps in blockDim.x, so
+    // we can just exit this warp entirely.
+    return;
+  }
+
+  int32_t linear_index = sorted_linear_indices[sorted_linear_indice_id];
+  // now, find the end of the segment (and thus the segment length `SL`).
+  int32_t SL = 1;
+  while (sorted_linear_indice_id + SL < indices_numel &&
+         sorted_linear_indices[sorted_linear_indice_id + SL] == linear_index) {
+    SL += 1;
+  }
+  // now, each segment corresponds to exactly one table `t` and row in that
+  // table (`idx`). Thus, we can hoist out some of the book-keeping.
+  auto info_0 = infos[sorted_linear_indice_id];
+  const int32_t t = info_0.b_t / B;
+  const int64_t table_offset = table_offsets[t];
+  const int32_t idx = linear_index - table_offset;
+
+  acc_type<scalar_t, true> g_local_sum_square = 0;
+  for (int32_t d = threadIdx.x; d * 4 < D; d += blockDim.x) {
+    Vec4T<scalar_t> sum;
+    for (int32_t sl = 0; sl < SL; ++sl) {
+      int32_t b = infos[sorted_linear_indice_id + sl].b_t % B;
+      // TODO: apply per-sample weighting.
+      Vec4T<scalar_t> grad_out(&grad_output[b][t][0] + d * 4);
+      sum.acc.x += grad_out.acc.x;
+      sum.acc.y += grad_out.acc.y;
+      sum.acc.z += grad_out.acc.z;
+      sum.acc.w += grad_out.acc.w;
+    }
+    g_local_sum_square += sum.acc.x * sum.acc.x + sum.acc.y * sum.acc.y +
+                          sum.acc.z * sum.acc.z + sum.acc.w * sum.acc.w;
+  }
+
+  const acc_type<scalar_t, true> g_sum_square =
+      warpReduceAllSum<acc_type<scalar_t, true>>(g_local_sum_square);
+
+  auto state = f.init_update(blockIdx.x * blockDim.x * blockDim.y +
+                             threadIdx.y * blockDim.x + threadIdx.x);
+
+  acc_type<scalar_t, true> multiplier =
+      f.update_momentum(g_sum_square, &optimizer_state[table_offset + idx], -1);
+
+  auto sample_weight_state = f.init_sample_weight(-1);
+  for (int32_t d = threadIdx.x; d * 4 < D; d += blockDim.x) {
+    Vec4T<scalar_t> sum;
+    for (int32_t sl = 0; sl < SL; ++sl) {
+      auto b = infos[sorted_linear_indice_id + sl].b_t % B;
+      Vec4T<scalar_t> grad_out(&grad_output[b][t][0] + d * 4);
+      sum.acc.x += grad_out.acc.x;
+      sum.acc.y += grad_out.acc.y;
+      sum.acc.z += grad_out.acc.z;
+      sum.acc.w += grad_out.acc.w;
+    }
+    f.update_weight(&weights[table_offset + idx][0] + d * 4, multiplier, sum,
+                    state, sample_weight_state);
+  }
+  f.update_sample_weight(sample_weight_state, -1);
+}
+
+c10::optional<Tensor> batched_embedding_backward_adagrad_exact_cuda(
+    Tensor grad_output, Tensor weights, Tensor table_offsets, Tensor indices,
+    Tensor offsets, c10::optional<Tensor> indice_weights,
+    Tensor optimizer_state, float learning_rate, float eps,
+    bool stochastic_rounding, int64_t BT_block_size) {
+  at::cuda::OptionalCUDAGuard device_guard;
+  device_guard.set_index(weights.get_device());
+
+  const auto T = table_offsets.size(0);
+  AT_ASSERT(T > 0);
+  const auto D = weights.size(1);
+  AT_ASSERT(D > 0);
+
+  // offsets = [B x T  + 1]
+  const auto B = (offsets.size(0) - 1) / T;
+  AT_ASSERT(B > 0);
+  AT_ASSERT(BT_block_size > 0);
+  if ((B * T) % BT_block_size != 0) {
+    BT_block_size = 1;
+  }
+  AT_ASSERT(D % 4 == 0);
+  AT_ASSERT(BT_block_size * kWarpSize <= kMaxThreads);
+  const dim3 threads(kWarpSize, BT_block_size);
+
+  c10::optional<Tensor> grad_indice_weights = c10::nullopt;
+  if (indice_weights) {
+    grad_indice_weights = at::empty(indices.sizes(), grad_output.options());
+  }
+
+  auto infos =
+      at::empty({indices.numel() * static_cast<int64_t>(sizeof(IndexInfo))},
+                indices.options().dtype(kByte));
+
+  auto infos_sorted =
+      at::empty({indices.numel() * static_cast<int64_t>(sizeof(IndexInfo))},
+                indices.options().dtype(kByte));
+
+  auto linear_indices = at::empty_like(indices);
+  auto linear_indices_sorted = at::empty_like(indices);
+
+  linear_index_weight_offsets_kernel<<<dim3((B * T) / BT_block_size), threads,
+                                       0, at::cuda::getCurrentCUDAStream()>>>(
+      table_offsets.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
+      indices.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
+      offsets.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
+      (IndexInfo *)infos.data_ptr(),
+      linear_indices.packed_accessor32<int32_t, 1, RestrictPtrTraits>());
+  AT_CUDA_CHECK(cudaGetLastError());
+
+  size_t temp_storage_bytes = 0;
+  AT_CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+      nullptr, temp_storage_bytes, (int32_t *)linear_indices.data_ptr(),
+      (int32_t *)linear_indices_sorted.data_ptr(),
+      (IndexInfo *)infos.data_ptr(), (IndexInfo *)infos_sorted.data_ptr(),
+      linear_indices.numel(), 0, int(log2(optimizer_state.numel()) + 1),
+      at::cuda::getCurrentCUDAStream(), false));
+
+  auto temp_storage = at::empty({static_cast<int64_t>(temp_storage_bytes)},
+                                indices.options().dtype(kByte));
+
+  AT_CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+      temp_storage.data_ptr(), temp_storage_bytes,
+      (int32_t *)linear_indices.data_ptr(),
+      (int32_t *)linear_indices_sorted.data_ptr(),
+      (IndexInfo *)infos.data_ptr(), (IndexInfo *)infos_sorted.data_ptr(),
+      linear_indices.numel(), 0, int(log2(optimizer_state.numel()) + 1),
+      at::cuda::getCurrentCUDAStream(), false));
+
+  const dim3 blocks((linear_indices.numel() + BT_block_size - 1) /
+                    BT_block_size);
+
+#define X(functor)                                                             \
+  batched_embedding_backward_adagrad_exact_kernel_1<                           \
+      scalar_t><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(     \
+      grad_output.packed_accessor32<scalar_t, 3, RestrictPtrTraits>(),         \
+      weights.packed_accessor64<scalar_t, 2, RestrictPtrTraits>(),             \
+      table_offsets.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),        \
+      indices.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),              \
+      offsets.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),              \
+      optimizer_state.packed_accessor32<acc_type<scalar_t, true>, 1,           \
+                                        RestrictPtrTraits>(),                  \
+      linear_indices_sorted                                                    \
+          .packed_accessor32<int32_t, 1, RestrictPtrTraits>(),                 \
+      (const IndexInfo *)infos_sorted.data_ptr(),                              \
+      static_cast<int32_t>(linear_indices_sorted.numel()), (functor))
+
+  AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+      weights.type(), "batched_embedding_backward_adagrad_approx_kernel", ([&] {
+        if (!stochastic_rounding) {
+          if (indice_weights) {
+            AT_ASSERT(false);
+          } else {
+            auto f = AdaGradFunctor<scalar_t, false>(learning_rate, eps);
+            X(f);
+          }
+        } else {
+          std::pair<uint64_t, uint64_t> rng_engine_inputs;
+          {
+            auto gen = at::cuda::detail::getDefaultCUDAGenerator();
+            std::lock_guard<std::mutex> lock(gen->mutex_);
+            rng_engine_inputs =
+                gen->philox_engine_inputs(((D + kWarpSize - 1) / kWarpSize));
+          }
+          if (indice_weights) {
+            AT_ASSERT(false);
+          } else {
+            auto f = StochasticRoundingAdaGradFunctor<scalar_t, false>(
+                learning_rate, eps, rng_engine_inputs);
+            X(f);
+          }
+        }
+      }));
+  AT_CUDA_CHECK(cudaGetLastError());
+
+#undef X
+
+  return grad_indice_weights;
 }

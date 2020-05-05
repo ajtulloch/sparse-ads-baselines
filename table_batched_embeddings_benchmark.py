@@ -39,42 +39,61 @@ def benchmark_torch_function(iters, f, *args):
 
 import functools
 
-def div_round_up(a, b): return int(((a + b - 1) // b) * b)
+
+def div_round_up(a, b):
+    return int(((a + b - 1) // b) * b)
+
 
 def benchmark_forward(B, E, T, L, D, iters, fp16, managed, mixed):
     logging.basicConfig(level=logging.DEBUG)
     import torch
     import table_batched_embeddings
+
     np.random.seed(42)
     if mixed:
-        mixed_D = [div_round_up(np.random.randint(low=int(0.5 * D), high=int(1.5 * D)), 4) for _ in range(T)]
+        mixed_D = [
+            div_round_up(np.random.randint(low=int(0.5 * D), high=int(1.5 * D)), 4)
+            for _ in range(T)
+        ]
         D = np.average(mixed_D)
-    cc = table_batched_embeddings_ops.TableBatchedEmbeddingBags(
-        T,
-        E,
-        D,
-        optimizer=table_batched_embeddings_ops.Optimizer.APPROX_ROWWISE_ADAGRAD,
-        learning_rate=0.1,
-        managed=table_batched_embeddings_ops.EmbeddingLocation.DEVICE if not managed else table_batched_embeddings_ops.EmbeddingLocation.HOST_MAPPED,
-        eps=0.1,
-        stochastic_rounding=False,
-        fp16=fp16,
-    ).cuda() if not mixed else table_batched_embeddings_ops.MixedDimTableBatchedEmbeddingBags(
-        [(E, d) for d in mixed_D],
-        optimizer=table_batched_embeddings_ops.Optimizer.APPROX_ROWWISE_ADAGRAD,
-        learning_rate=0.1,
-        managed=table_batched_embeddings_ops.EmbeddingLocation.DEVICE if not managed  else table_batched_embeddings_ops.EmbeddingLocation.HOST_MAPPED,
-        eps=0.1,
-        stochastic_rounding=False,
-        fp16=fp16,
-    ).cuda()
+    cc = (
+        table_batched_embeddings_ops.TableBatchedEmbeddingBags(
+            T,
+            E,
+            D,
+            optimizer=table_batched_embeddings_ops.Optimizer.APPROX_ROWWISE_ADAGRAD,
+            learning_rate=0.1,
+            managed=table_batched_embeddings_ops.EmbeddingLocation.DEVICE
+            if not managed
+            else table_batched_embeddings_ops.EmbeddingLocation.HOST_MAPPED,
+            eps=0.1,
+            stochastic_rounding=False,
+            fp16=fp16,
+        ).cuda()
+        if not mixed
+        else table_batched_embeddings_ops.MixedDimTableBatchedEmbeddingBags(
+            [(E, d) for d in mixed_D],
+            optimizer=table_batched_embeddings_ops.Optimizer.APPROX_ROWWISE_ADAGRAD,
+            learning_rate=0.1,
+            managed=table_batched_embeddings_ops.EmbeddingLocation.DEVICE
+            if not managed
+            else table_batched_embeddings_ops.EmbeddingLocation.HOST_MAPPED,
+            eps=0.1,
+            stochastic_rounding=False,
+            fp16=fp16,
+        ).cuda()
+    )
 
     logging.info(
         f"Embedding parameters: {cc.embedding_weights.numel() / 1.0e9:.2f}GParam"
     )
 
+    R = False
+
     def w2(c):
-        # return c
+        if not R:
+            return c
+
         @functools.wraps(c)
         def z(w, o, x, *args):
             c(w, o, x.random_(0, E - 1), *args)
@@ -82,7 +101,9 @@ def benchmark_forward(B, E, T, L, D, iters, fp16, managed, mixed):
         return z
 
     def w3(c):
-        # return c
+        if not R:
+            return c
+
         @functools.wraps(c)
         def z(g, w, o, x, *args):
             c(g, w, o, x.random_(0, E - 1), *args)
@@ -90,22 +111,38 @@ def benchmark_forward(B, E, T, L, D, iters, fp16, managed, mixed):
         return z
 
     def w4(c):
-        # return c
+        if not R:
+            return c
+
         @functools.wraps(c)
         def z(g, w, o, a, x, *args):
             c(g, w, o, a, x.random_(0, E - 1), *args)
 
         return z
 
-
     def w6(c):
-        # return c
+        if not R:
+            return c
+
         @functools.wraps(c)
         def z(g, w, o, a, b, d, x, *args):
             c(g, w, o, a, b, d, x.random_(0, E - 1), *args)
 
         return z
+
+    zs = [
+        torch.tensor(np.random.zipf(a=1.2, size=(B, L))).int().cuda()
+        % E
+        # torch.randint(low=0, high=E - 1, size=(T, B, L)).int().cuda()
+    ]
+
+    print(
+        f"Duplicate proportion: {1.0 - np.unique(zs[0].detach().cpu().numpy()).size / zs[0].detach().cpu().numpy().size}"
+    )
+    merged_indices = torch.stack(zs, dim=0)
+
     merged_indices = torch.randint(low=0, high=E - 1, size=(T, B, L)).int().cuda()
+
     (indices, offsets) = get_table_batched_offsets_from_dense(merged_indices)
     assert indices.shape[0] == B * T * L
     assert all(
@@ -113,54 +150,92 @@ def benchmark_forward(B, E, T, L, D, iters, fp16, managed, mixed):
     )
     per_sample_weights = None
     print(indices.shape, indices.min(), indices.max(), indices)
-    y0 = table_batched_embeddings.forward(
-        cc.embedding_weights, cc.table_offsets, indices, offsets, per_sample_weights, L, 1, False
-    ) if not mixed else table_batched_embeddings.forward_mixed_D(
-        cc.embedding_weights, cc.table_offsets, cc.dim_offsets, cc.total_D, indices, offsets, per_sample_weights, L, 1, False
+    y0 = (
+        table_batched_embeddings.forward(
+            cc.embedding_weights,
+            cc.table_offsets,
+            indices,
+            offsets,
+            per_sample_weights,
+            L,
+            1,
+            False,
+        )
+        if not mixed
+        else table_batched_embeddings.forward_mixed_D(
+            cc.embedding_weights,
+            cc.table_offsets,
+            cc.dim_offsets,
+            cc.total_D,
+            indices,
+            offsets,
+            per_sample_weights,
+            L,
+            1,
+            False,
+        )
     )
 
     for BT_block_size in [1, 2, 4, 8, 16, 32, 64, 128]:
         for shmem in [True, False]:
-            y = table_batched_embeddings.forward(
-                cc.embedding_weights,
-                cc.table_offsets,
-                indices,
-                offsets,
-                per_sample_weights,
-                L,
-                BT_block_size,
-                shmem,
-            ) if not mixed else table_batched_embeddings.forward_mixed_D(
-                cc.embedding_weights, cc.table_offsets, cc.dim_offsets, cc.total_D, indices, offsets, per_sample_weights, L, BT_block_size, False
+            y = (
+                table_batched_embeddings.forward(
+                    cc.embedding_weights,
+                    cc.table_offsets,
+                    indices,
+                    offsets,
+                    per_sample_weights,
+                    L,
+                    BT_block_size,
+                    shmem,
+                )
+                if not mixed
+                else table_batched_embeddings.forward_mixed_D(
+                    cc.embedding_weights,
+                    cc.table_offsets,
+                    cc.dim_offsets,
+                    cc.total_D,
+                    indices,
+                    offsets,
+                    per_sample_weights,
+                    L,
+                    BT_block_size,
+                    False,
+                )
             )
             torch.testing.assert_allclose(y, y0)
 
     for BT_block_size in [1, 2, 4, 8, 16, 32, 64, 128]:
         for shmem in [True, False]:
-            time_per_iter = benchmark_torch_function(
-                iters,
-                w2(table_batched_embeddings.forward),
-                cc.embedding_weights,
-                cc.table_offsets,
-                indices,
-                offsets,
-                per_sample_weights,
-                L,
-                BT_block_size,
-                shmem,
-            ) if not mixed else benchmark_torch_function(
-                iters,
-                w4(table_batched_embeddings.forward_mixed_D),
-                cc.embedding_weights,
-                cc.table_offsets,
-                cc.dim_offsets,
-                cc.total_D,
-                indices,
-                offsets,
-                per_sample_weights,
-                L,
-                BT_block_size,
-                shmem)
+            time_per_iter = (
+                benchmark_torch_function(
+                    iters,
+                    w2(table_batched_embeddings.forward),
+                    cc.embedding_weights,
+                    cc.table_offsets,
+                    indices,
+                    offsets,
+                    per_sample_weights,
+                    L,
+                    BT_block_size,
+                    shmem,
+                )
+                if not mixed
+                else benchmark_torch_function(
+                    iters,
+                    w4(table_batched_embeddings.forward_mixed_D),
+                    cc.embedding_weights,
+                    cc.table_offsets,
+                    cc.dim_offsets,
+                    cc.total_D,
+                    indices,
+                    offsets,
+                    per_sample_weights,
+                    L,
+                    BT_block_size,
+                    shmem,
+                )
+            )
             logging.info(
                 f"Forward, B: {B} {(BT_block_size, shmem)}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {(2 if fp16 else 4) * B * T * L * D / time_per_iter / 1.0e9: .2f}GB/s, T: {time_per_iter * 1.0e6:.0f}us"
             )
@@ -196,82 +271,90 @@ def benchmark_forward(B, E, T, L, D, iters, fp16, managed, mixed):
         16,
         32,
     ]:
-        time_per_iter = benchmark_torch_function(
-            iters,
-            w3(table_batched_embeddings.backward_approx_adagrad),
-            go,
-            cc.embedding_weights,
-            cc.table_offsets,
-            indices,
-            offsets,
-            per_sample_weights,
-            cc.optimizer_state,
-            learning_rate,
-            eps,
-            L,
-            False,
-            BT_block_size,
-        ) if not mixed else benchmark_torch_function(
-            iters,
-            w6(table_batched_embeddings.backward_approx_adagrad_mixed_D),
-            go,
-            cc.embedding_weights,
-            cc.table_offsets,
-            cc.table_dim_offsets,
-            cc.dim_offsets,
-            cc.total_D,
-            indices,
-            offsets,
-            per_sample_weights,
-            cc.optimizer_state,
-            learning_rate,
-            eps,
-            L,
-            False,
-            BT_block_size,
-        )
+        for exact in [0, 1]:
+            for stochastic in [0, 1] if fp16 else [0]:
+                if not exact:
+                    time_per_iter = (
+                        benchmark_torch_function(
+                            iters,
+                            w3(table_batched_embeddings.backward_approx_adagrad),
+                            go,
+                            cc.embedding_weights,
+                            cc.table_offsets,
+                            indices,
+                            offsets,
+                            per_sample_weights,
+                            cc.optimizer_state,
+                            learning_rate,
+                            eps,
+                            L,
+                            stochastic,
+                            BT_block_size,
+                        )
+                        if not mixed
+                        else benchmark_torch_function(
+                            iters,
+                            w6(
+                                table_batched_embeddings.backward_approx_adagrad_mixed_D
+                            ),
+                            go,
+                            cc.embedding_weights,
+                            cc.table_offsets,
+                            cc.table_dim_offsets,
+                            cc.dim_offsets,
+                            cc.total_D,
+                            indices,
+                            offsets,
+                            per_sample_weights,
+                            cc.optimizer_state,
+                            learning_rate,
+                            eps,
+                            L,
+                            stochastic,
+                            BT_block_size,
+                        )
+                    )
+                else:
+                    time_per_iter = (
+                        benchmark_torch_function(
+                            iters,
+                            w3(table_batched_embeddings.backward_exact_adagrad),
+                            go,
+                            cc.embedding_weights,
+                            cc.table_offsets,
+                            indices,
+                            offsets,
+                            per_sample_weights,
+                            cc.optimizer_state,
+                            learning_rate,
+                            eps,
+                            stochastic,
+                            BT_block_size,
+                        )
+                        if not mixed
+                        else benchmark_torch_function(
+                            iters,
+                            w6(table_batched_embeddings.backward_exact_adagrad_mixed_D),
+                            go,
+                            cc.embedding_weights,
+                            cc.table_offsets,
+                            cc.table_dim_offsets,
+                            cc.dim_offsets,
+                            cc.total_D,
+                            indices,
+                            offsets,
+                            per_sample_weights,
+                            cc.optimizer_state,
+                            learning_rate,
+                            eps,
+                            stochastic,
+                            BT_block_size,
+                        )
+                    )
 
-        logging.info(
-            f"Backward-ADAGRAD-nonstochastic, B: {B} ({BT_block_size}), E: {E}, T: {T}, D: {D}, L: {L}, BW: {2 * (2 if fp16 else 4) * B * T * L * D / time_per_iter / 1.0e9: .2f}GB/s, T: {time_per_iter * 1.0e6:.0f}us"
-        )
-        time_per_iter = benchmark_torch_function(
-            iters,
-            w3(table_batched_embeddings.backward_approx_adagrad),
-            go,
-            cc.embedding_weights,
-            cc.table_offsets,
-            indices,
-            offsets,
-            per_sample_weights,
-            cc.optimizer_state,
-            learning_rate,
-            eps,
-            L,
-            True,
-            BT_block_size,
-        ) if not mixed else benchmark_torch_function(
-            iters,
-            w6(table_batched_embeddings.backward_approx_adagrad_mixed_D),
-            go,
-            cc.embedding_weights,
-            cc.table_offsets,
-            cc.table_dim_offsets,
-            cc.dim_offsets,
-            cc.total_D,
-            indices,
-            offsets,
-            per_sample_weights,
-            cc.optimizer_state,
-            learning_rate,
-            eps,
-            L,
-            True,
-            BT_block_size,
-        )
-
-        logging.info(
-            f"Backward-ADAGRAD-stochastic, B: {B} ({BT_block_size}), E: {E}, T: {T}, D: {D}, L: {L}, BW: {2 * (2 if fp16 else 4) * B * T * L * D / time_per_iter / 1.0e9: .2f}GB/s, T: {time_per_iter * 1.0e6:.0f}us"
-        )
+                logging.info(
+                    f"Backward-ADAGRAD-{'nonstochastic' if not stochastic else 'stochastic'}-{'EXACT' if exact else 'APPROX'}-{'R' if R else 'NR'}, B: {B} ({BT_block_size}), E: {E}, T: {T}, D: {D}, L: {L}, BW: {2 * (2 if fp16 else 4) * B * T * L * D / time_per_iter / 1.0e9: .2f}GB/s, T: {time_per_iter * 1.0e6:.0f}us"
+                )
 
 
 @click.command()
@@ -285,7 +368,6 @@ def benchmark_forward(B, E, T, L, D, iters, fp16, managed, mixed):
 @click.option("--fp16", is_flag=True, default=False)
 @click.option("--managed", is_flag=True, default=False)
 @click.option("--mixed", is_flag=True, default=False)
-
 def cli(
     num_tables,
     num_embeddings,
@@ -310,7 +392,7 @@ def cli(
             iters,
             fp16,
             managed,
-            mixed
+            mixed,
         )
 
     if remote:
@@ -318,7 +400,7 @@ def cli(
 
         executor = submitit.AutoExecutor(folder="sparse_embedding_perf")
         executor.update_parameters(
-            timeout_min=10, partition="dev", constraint="volta32gb", gpus_per_node=8
+            timeout_min=10, partition="dev", constraint="volta32gb", gpus_per_node=1
         )
         job = executor.submit(f)
         job.wait()

@@ -35,7 +35,7 @@ class LookupFunction(torch.autograd.Function):
             per_sample_weights,
             optimizer_state,
         )
-        BT_block_size = max(1024 / weights.shape[0], 1) * 4
+        BT_block_size = int(max(256 / weights.shape[1], 1))
         L_max = 200  # TODO: pass this in correctly.
         return table_batched_embeddings.forward(
             weights,
@@ -61,9 +61,9 @@ class LookupFunction(torch.autograd.Function):
             optimizer_state,
         ) = ctx.saved_tensors
         L_max = 200
-        assert ctx.optimizer in (Optimizer.SGD, Optimizer.APPROX_ROWWISE_ADAGRAD)
+        assert ctx.optimizer in (Optimizer.SGD, Optimizer.APPROX_ROWWISE_ADAGRAD, Optimizer.EXACT_ROWWISE_ADAGRAD)
         if ctx.optimizer == Optimizer.SGD:
-            BT_block_size = max(1024 / weights.shape[0], 1) * 4
+            BT_block_size = int(max(256 / (weights.shape[1], 1)))
             assert per_sample_weights is None
             grad_per_sample_weight = table_batched_embeddings.backward_sgd(
                 grad_output,
@@ -92,6 +92,21 @@ class LookupFunction(torch.autograd.Function):
                 ctx.stochastic_rounding,
                 BT_block_size,
             )
+        elif ctx.optimizer == Optimizer.EXACT_ROWWISE_ADAGRAD:
+            BT_block_size = 1
+            grad_per_sample_weight = table_batched_embeddings.backward_exact_adagrad(
+                grad_output,
+                weights,
+                table_offsets,
+                indices,
+                offsets,
+                per_sample_weights,
+                optimizer_state,
+                ctx.learning_rate,
+                ctx.eps,
+                ctx.stochastic_rounding,
+                BT_block_size,
+            )            
         return (
             torch.cuda.sparse.FloatTensor(*weights.size()),
             None,
@@ -109,6 +124,7 @@ class LookupFunction(torch.autograd.Function):
 class Optimizer(enum.Enum):
     SGD = 1
     APPROX_ROWWISE_ADAGRAD = 2
+    EXACT_ROWWISE_ADAGRAD = 3
 
 
 class EmbeddingLocation(enum.Enum):
@@ -250,25 +266,44 @@ class MixedDimLookupFunction(torch.autograd.Function):
             optimizer_state,
         ) = ctx.saved_tensors
         L_max = 200
-        assert ctx.optimizer in (Optimizer.APPROX_ROWWISE_ADAGRAD,)
+        assert ctx.optimizer in (Optimizer.APPROX_ROWWISE_ADAGRAD, Optimizer.EXACT_ROWWISE_ADAGRAD)
         BT_block_size = 1
-        grad_per_sample_weight = table_batched_embeddings.backward_approx_adagrad_mixed_D(
-            grad_output,
-            weights,
-            table_offsets,
-            table_dim_offsets,
-            dim_offsets,
-            ctx.total_D,
-            indices,
-            offsets,
-            per_sample_weights,
-            optimizer_state,
-            ctx.learning_rate,
-            ctx.eps,
-            L_max,
-            ctx.stochastic_rounding,
-            BT_block_size,
-        )
+        if ctx.optimizer == Optimizer.APPROX_ROWWISE_ADAGRAD:
+            grad_per_sample_weight = table_batched_embeddings.backward_approx_adagrad_mixed_D(
+                grad_output,
+                weights,
+                table_offsets,
+                table_dim_offsets,
+                dim_offsets,
+                ctx.total_D,
+                indices,
+                offsets,
+                per_sample_weights,
+                optimizer_state,
+                ctx.learning_rate,
+                ctx.eps,
+                L_max,
+                ctx.stochastic_rounding,
+                BT_block_size,
+            )
+        else:
+            grad_per_sample_weight = table_batched_embeddings.backward_exact_adagrad_mixed_D(
+                grad_output,
+                weights,
+                table_offsets,
+                table_dim_offsets,
+                dim_offsets,
+                ctx.total_D,
+                indices,
+                offsets,
+                per_sample_weights,
+                optimizer_state,
+                ctx.learning_rate,
+                ctx.eps,
+                ctx.stochastic_rounding,
+                BT_block_size,
+            )
+
         return (
             torch.cuda.sparse.FloatTensor(*weights.size()),  # weights
             None,  # table_offsets
