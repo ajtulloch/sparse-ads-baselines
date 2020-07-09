@@ -1,4 +1,4 @@
-from hypothesis import given, settings, Verbosity, example, Phase
+from hypothesis import given, settings, Verbosity
 import hypothesis.strategies as st
 import torch
 import numpy as np
@@ -16,7 +16,9 @@ def get_offsets_from_dense(indices):
     return (
         indices.int().contiguous().view(-1),
         torch.tensor(
-            np.cumsum(np.asarray([0] + [L for _ in range(B)])[:-1]).astype(np.int32)
+            np.cumsum(np.asarray([0] + [L for _ in range(B)])[:-1]).astype(
+                np.int32
+            )
         ).cuda(),
     )
 
@@ -32,7 +34,9 @@ def get_table_batched_offsets_from_dense(merged_indices):
 
 
 def table_batched_embeddings_indices_and_offsets(
-    indices_per_table, offsets_per_table, pinned_total_indices_per_table_buffer=None
+    indices_per_table,
+    offsets_per_table,
+    pinned_total_indices_per_table_buffer=None,
 ):
 
     if pinned_total_indices_per_table_buffer is None:
@@ -67,23 +71,31 @@ def table_batched_embeddings_indices_and_offsets(
 @settings(verbosity=Verbosity.verbose, deadline=None, max_examples=20)
 def test_construct_offsets(T, B, L, pinned):
     Ls_per_table = [
-        np.random.randint(low=1, high=int(L), size=(B,)).tolist() for _ in range(T)
+        np.random.randint(low=1, high=int(L), size=(B,)).tolist()
+        for _ in range(T)
     ]
 
     indices_per_table = [
-        torch.randint(low=0, high=int(1e4), size=(sum(Ls_per_table[t]),)).long().cuda()
+        torch.randint(low=0, high=int(1e4), size=(sum(Ls_per_table[t]),))
+        .long()
+        .cuda()
         for t in range(T)
     ]
 
     offsets_per_table = [
-        torch.cumsum(torch.tensor([0] + Ls_per_table[t][:-1]).int().cuda(), dim=0)
+        torch.cumsum(
+            torch.tensor([0] + Ls_per_table[t][:-1]).int().cuda(), dim=0
+        )
         for t in range(T)
     ]
 
     pinned_total_indices_per_table_buffer = (
         torch.tensor([0 for _ in range(T)]).int().pin_memory()
     )
-    (fused_indices, fused_offsets) = table_batched_embeddings_indices_and_offsets(
+    (
+        fused_indices,
+        fused_offsets,
+    ) = table_batched_embeddings_indices_and_offsets(
         indices_per_table,
         offsets_per_table,
         pinned_total_indices_per_table_buffer if pinned else None,
@@ -100,10 +112,16 @@ def test_construct_offsets(T, B, L, pinned):
             idx_end = fused_offsets[t * B + b + 1]
             L_bt = idx_end - idx_start
             if b != B - 1:
-                assert L_bt == offsets_per_table[t][b + 1] - offsets_per_table[t][b]
+                assert (
+                    L_bt
+                    == offsets_per_table[t][b + 1] - offsets_per_table[t][b]
+                )
             else:
-                assert L_bt == indices_per_table[t].numel() - offsets_per_table[t][b]
-            for l in range(L_bt):
+                assert (
+                    L_bt
+                    == indices_per_table[t].numel() - offsets_per_table[t][b]
+                )
+            for _ in range(L_bt):
                 torch.testing.assert_allclose(
                     fused_indices[idx_start : idx_start + L_bt],
                     indices_per_table[t][
@@ -124,7 +142,10 @@ def test_construct_offsets(T, B, L, pinned):
 def test_forward(T, D, B, L, fp16, weighted):
     D = D * 4
     E = int(1e4)
-    bs = [torch.nn.EmbeddingBag(E, D, mode="sum", sparse=True).cuda() for _ in range(T)]
+    bs = [
+        torch.nn.EmbeddingBag(E, D, mode="sum", sparse=True).cuda()
+        for _ in range(T)
+    ]
     if fp16:
         bs = [b.half() for b in bs]
 
@@ -171,12 +192,17 @@ def test_forward(T, D, B, L, fp16, weighted):
 def test_backward_sgd(T, D, B, L, fp16):
     D = D * 4
     E = int(1e4)
-    bs = [torch.nn.EmbeddingBag(E, D, mode="sum", sparse=True).cuda() for _ in range(T)]
+    bs = [
+        torch.nn.EmbeddingBag(E, D, mode="sum", sparse=True).cuda()
+        for _ in range(T)
+    ]
     if fp16:
         bs = [b.half() for b in bs]
     xs = [
         torch.from_numpy(
-            np.random.choice(range(E), size=(B, L), replace=False).astype(np.int64)
+            np.random.choice(range(E), size=(B, L), replace=False).astype(
+                np.int64
+            )
         ).cuda()
         for _ in range(T)
     ]
@@ -191,8 +217,6 @@ def test_backward_sgd(T, D, B, L, fp16):
     # do SGD update
     lr = 0.05
     new_weights = [(b.weight - b.weight.grad * lr) for b in bs]
-
-    f = torch.cat([f.view(B, 1, D) for f in fs], dim=1)
 
     cc = table_batched_embeddings_ops.TableBatchedEmbeddingBags(
         T,
@@ -229,19 +253,26 @@ def test_backward_sgd(T, D, B, L, fp16):
 )
 # @example(2, 1, 1, 1, 1, False, False, False, True)
 @settings(verbosity=Verbosity.verbose, deadline=None, max_examples=10)
-def test_backward_adagrad(T, D, B, L, D_gradcheck, fp16, stochastic_rounding, weighted, exact):
+def test_backward_adagrad(
+    T, D, B, L, D_gradcheck, fp16, stochastic_rounding, weighted, exact
+):
     E = int(1e4) if not exact else int(1e2)
     D_gradcheck = D_gradcheck * 4
     weighted = False if exact else weighted
 
     D = D * 4
-    bs = [torch.nn.EmbeddingBag(E, D, mode="sum", sparse=True).cuda() for _ in range(T)]
+    bs = [
+        torch.nn.EmbeddingBag(E, D, mode="sum", sparse=True).cuda()
+        for _ in range(T)
+    ]
     if fp16:
         bs = [b.half() for b in bs]
 
     xs = [
         torch.from_numpy(
-            np.random.choice(range(E), size=(B, L), replace=False if not exact else True).astype(np.int64)
+            np.random.choice(
+                range(E), size=(B, L), replace=False if not exact else True
+            ).astype(np.int64)
         ).cuda()
         for _ in range(T)
     ]
@@ -265,13 +296,13 @@ def test_backward_adagrad(T, D, B, L, D_gradcheck, fp16, stochastic_rounding, we
     lr = 0.5
     eps = 0.2
 
-    new_weights = [b.weight for b in bs]
-    f = torch.cat([f.view(B, 1, D) for f in fs], dim=1)
     cc = table_batched_embeddings_ops.TableBatchedEmbeddingBags(
         T,
         E,
         D,
-        optimizer=table_batched_embeddings_ops.Optimizer.APPROX_ROWWISE_ADAGRAD if not exact else table_batched_embeddings_ops.Optimizer.EXACT_ROWWISE_ADAGRAD,
+        optimizer=table_batched_embeddings_ops.Optimizer.APPROX_ROWWISE_ADAGRAD
+        if not exact
+        else table_batched_embeddings_ops.Optimizer.EXACT_ROWWISE_ADAGRAD,
         learning_rate=lr,
         eps=eps,
         fp16=fp16,
@@ -351,8 +382,10 @@ def test_backward_adagrad(T, D, B, L, D_gradcheck, fp16, stochastic_rounding, we
 @settings(verbosity=Verbosity.verbose, deadline=None, max_examples=20)
 def test_forward_mixed(T, D_max, B, L, fp16, weighted):
     Ds = [np.random.randint(low=1, high=D_max) * 4 for _ in range(T)]
-    E = int(1e4) if not exact else int(1e2)
-    Es = [np.random.randint(low=int(0.5 * E), high=int(2 * E)) for _ in range(T)]
+    E = int(1e4)
+    Es = [
+        np.random.randint(low=int(0.5 * E), high=int(2 * E)) for _ in range(T)
+    ]
     bs = [
         torch.nn.EmbeddingBag(E, D, mode="sum", sparse=True).cuda()
         for (E, D) in zip(Es, Ds)
@@ -412,7 +445,10 @@ def test_backward_adagrad_mixed(
     Ds = [np.random.randint(low=1, high=D_max) * 4 for _ in range(T)]
     # Ds = [4 for _ in range(T)]
 
-    Es = [np.random.randint(low=int(0.5 * 1e4), high=int(2 * 1.0e4)) for _ in range(T)]
+    Es = [
+        np.random.randint(low=int(0.5 * 1e4), high=int(2 * 1.0e4))
+        for _ in range(T)
+    ]
     bs = [
         torch.nn.EmbeddingBag(E, D, mode="sum", sparse=True).cuda()
         for (E, D) in zip(Es, Ds)
@@ -423,7 +459,9 @@ def test_backward_adagrad_mixed(
 
     xs = [
         torch.from_numpy(
-            np.random.choice(range(E), size=(B, L), replace=True if exact else False).astype(np.int64)
+            np.random.choice(
+                range(E), size=(B, L), replace=True if exact else False
+            ).astype(np.int64)
         ).cuda()
         for E in Es
     ]
@@ -449,12 +487,11 @@ def test_backward_adagrad_mixed(
     lr = 0.5
     eps = 0.2
 
-    new_weights = [b.weight for b in bs]
-    f = torch.cat([f.view(B, -1) for f in fs], dim=1)
-
     cc = table_batched_embeddings_ops.MixedDimTableBatchedEmbeddingBags(
         [(E, D) for (E, D) in zip(Es, Ds)],
-        optimizer=table_batched_embeddings_ops.Optimizer.EXACT_ROWWISE_ADAGRAD if exact else table_batched_embeddings_ops.Optimizer.APPROX_ROWWISE_ADAGRAD,
+        optimizer=table_batched_embeddings_ops.Optimizer.EXACT_ROWWISE_ADAGRAD
+        if exact
+        else table_batched_embeddings_ops.Optimizer.APPROX_ROWWISE_ADAGRAD,
         learning_rate=lr,
         eps=eps,
         fp16=fp16,
@@ -492,7 +529,10 @@ def test_backward_adagrad_mixed(
                 bs[t].weight.float(),
                 value=-lr,
                 tensor1=bs[t].weight.grad.float().to_dense(),
-                tensor2=cc.split_optimizer_state()[t].sqrt_().add_(eps).view(-1, 1),
+                tensor2=cc.split_optimizer_state()[t]
+                .sqrt_()
+                .add_(eps)
+                .view(-1, 1),
             ),
             atol=1.0e-3 if fp16 else 1.0e-4,
             rtol=1.0e-3 if fp16 else 1.0e-4,
@@ -518,4 +558,196 @@ def test_backward_adagrad_mixed(
         indices.requires_grad = False
         offsets.requires_grad = False
         cc.embedding_weights.requires_grad = False
-        torch.autograd.gradcheck(lambda *args: cc(*args), (indices, offsets, per_sample_weights))
+        torch.autograd.gradcheck(
+            lambda *args: cc(*args), (indices, offsets, per_sample_weights)
+        )
+
+
+@given(
+    st.integers(min_value=1, max_value=1),
+    st.integers(min_value=1, max_value=32),
+    st.integers(min_value=64, max_value=64),
+    st.integers(min_value=1, max_value=20),
+)
+@settings(verbosity=Verbosity.verbose, deadline=None, max_examples=20)
+def test_lxu_cache_populate(C, D, B, L):
+    C = 1000
+    D = D * 4
+    E = int(1e4)
+    bs = torch.nn.EmbeddingBag(E, D, mode="sum", sparse=True).cuda()
+    xs = torch.randint(low=0, high=E, size=(B, L)).cuda()
+    (indices, offsets) = get_table_batched_offsets_from_dense(xs.view(1, B, L))
+    bs(xs)
+
+    ASSOC = 32
+    lxu_cache_state = torch.zeros(4, C, ASSOC).int().cuda()
+    lxu_cache_weights = torch.zeros(C * ASSOC, D).float().cuda()
+
+    print(C, D, B, L)
+    table_batched_embeddings.lxu_cache_populate(
+        bs.weight.view(E, D), indices, lxu_cache_state, lxu_cache_weights, 1, 1
+    )
+    for x in indices.cpu().numpy():
+        idx_set = lxu_cache_state[2, x % C, :].cpu().detach().numpy().tolist()
+        t_set = lxu_cache_state[0, x % C, :].cpu().detach().numpy().tolist()
+        valid_idx = [
+            (idx, t)
+            for (assoc, (idx, t)) in enumerate(zip(idx_set, t_set))
+            if t > 0
+        ]
+        assert x in idx_set, (x, idx_set)
+        assert 1 in t_set
+        assert (x, 1) in valid_idx, (x, valid_idx)
+
+
+@given(
+    st.integers(min_value=1, max_value=1),
+    st.integers(min_value=1, max_value=32),
+    st.integers(min_value=64, max_value=64),
+    st.integers(min_value=1, max_value=20),
+)
+@settings(verbosity=Verbosity.verbose, deadline=None, max_examples=20)
+def test_lxu_cache_lookup(C, D, B, L):
+    C = 1000
+    D = D * 4
+    E = int(1e4)
+    bs = torch.nn.EmbeddingBag(E, D, mode="sum", sparse=True).cuda()
+    xs = torch.randint(low=0, high=E, size=(B, L)).cuda()
+    (indices, offsets) = get_table_batched_offsets_from_dense(xs.view(1, B, L))
+    bs(xs)
+
+    ASSOC = 32
+    lxu_cache_state = torch.zeros(4, C, ASSOC).int().cuda()
+    lxu_cache_weights = torch.zeros(C * ASSOC, D).float().cuda()
+
+    print(C, D, B, L)
+    table_batched_embeddings.lxu_cache_populate(
+        bs.weight.view(E, D), indices, lxu_cache_state, lxu_cache_weights, 1, 1
+    )
+    lxu_cache_locations = table_batched_embeddings.lxu_cache_lookup(
+        indices, lxu_cache_state, 5, 1
+    )
+    for (loc, idx) in zip(
+        lxu_cache_locations.cpu().numpy().tolist(),
+        indices.cpu().numpy().tolist(),
+    ):
+        loc_set = loc // ASSOC
+        loc_slot = loc % ASSOC
+        assert lxu_cache_state[2, loc_set, loc_slot] == idx
+        assert lxu_cache_state[0, loc_set, loc_slot] == 5
+        assert lxu_cache_state[1, loc_set, loc_slot] > 0
+
+
+@given(
+    st.integers(min_value=1, max_value=2048),
+    st.integers(min_value=1, max_value=32),
+    st.integers(min_value=1, max_value=2048),
+    st.integers(min_value=1, max_value=20),
+    st.integers(min_value=1, max_value=100),
+)
+@settings(verbosity=Verbosity.verbose, deadline=None, max_examples=100)
+def test_lxu_cache_forward(C, D, B, L, iters):
+    D = D * 4
+    E = int(1e6)
+    bs = torch.nn.EmbeddingBag(E, D, mode="sum", sparse=True).cuda()
+    ASSOC = 32
+    lxu_cache_state = torch.zeros(4, C, ASSOC).int().cuda()
+    lxu_cache_state[2, :, :] = -1
+    # lxu_cache_state[0, :, :].random_(0, 100)
+    lxu_cache_weights = torch.zeros(C * ASSOC, D).float().cuda()
+    lxu_weights = bs.weight.clone().view(E, D)
+
+    # iters = 20
+    for t in range(1, iters):
+        xs = torch.tensor(np.random.zipf(1.15, size=(B, L))).cuda() % E
+        # xs = torch.randint(low=0, high=E, size=(B, L)).cuda()
+        (indices, offsets) = get_table_batched_offsets_from_dense(
+            xs.view(1, B, L)
+        )
+        ys = bs(xs)
+
+        table_batched_embeddings.lxu_cache_populate(
+            lxu_weights,
+            indices,
+            lxu_cache_state,
+            lxu_cache_weights,
+            t,
+            32,
+        )
+        lxu_cache_locations = table_batched_embeddings.lxu_cache_lookup(
+            indices, lxu_cache_state, t, 32
+        )
+        NOT_FOUND = np.iinfo(np.int32).max
+        print(
+            f"Cache hit rate on iteration {t}: {np.count_nonzero(lxu_cache_locations.cpu().numpy() != NOT_FOUND) / lxu_cache_locations.numel() * 100:.2f}%, {np.count_nonzero(lxu_cache_locations.cpu().numpy() == NOT_FOUND)} misses"
+        )
+        if np.count_nonzero(lxu_cache_locations.cpu().numpy() == NOT_FOUND) > 0:
+            for idx in indices[lxu_cache_locations.cpu().numpy() == NOT_FOUND].cpu().numpy():
+                assert(idx not in lxu_cache_state[2, idx % C, :].cpu().numpy().tolist())
+                assert(np.count_nonzero(lxu_cache_state[0, idx % C, :].cpu().numpy()) == ASSOC), (idx, lxu_cache_state[0, idx % C, :])
+
+
+        lxu_cache_ys = table_batched_embeddings.lxu_cache_forward(
+            lxu_weights,
+            indices,
+            offsets,
+            None,
+            lxu_cache_locations,
+            lxu_cache_weights,
+            32,
+        )
+        torch.testing.assert_allclose(ys, lxu_cache_ys)
+    # print(lxu_cache_state[2])
+    # print(lxu_cache_state[0])
+    flush_weights = bs.weight.clone()
+    table_batched_embeddings.lxu_cache_flush(
+        flush_weights, lxu_cache_state, lxu_cache_weights, 32
+    )
+    torch.testing.assert_allclose(flush_weights, bs.weight)
+
+
+@given(
+    st.integers(min_value=1, max_value=2048),
+    st.integers(min_value=1, max_value=32),
+    st.integers(min_value=1, max_value=2048),
+    st.integers(min_value=1, max_value=20),
+    st.integers(min_value=1, max_value=10),
+)
+@settings(verbosity=Verbosity.verbose, deadline=None, max_examples=100)
+def test_lxu_cache_forward_backward(C, D, B, L, iters):
+    # C = int(1e6)
+    # B = 16384
+    # L = 10
+    # D = 16
+    D = D * 4
+    E = int(1e6)
+    bs = table_batched_embeddings_ops.TableBatchedEmbeddingBags(1, E, D, learning_rate=0.05, managed=table_batched_embeddings_ops.EmbeddingLocation.HOST_MAPPED).cuda()
+    bscache = table_batched_embeddings_ops.LXUCacheEmbeddingBag(E, D, C, learning_rate=0.05).cuda()
+
+    bscache.embedding_weights.detach().view(E, D)[:] = bs.embedding_weights.view(E, D)
+    for _ in range(iters):
+        # Due to different atomicAdd(..) updates, etc, these can differ.
+        # xs = torch.tensor(np.random.zipf(1.0001, size=(B, L))).cuda() % E
+
+        xs = torch.tensor(
+            np.random.choice(range(E), size=(B, L), replace=False).astype(
+                np.int64
+        )).cuda()
+
+        (indices, offsets) = get_table_batched_offsets_from_dense(
+            xs.view(1, B, L)
+        )
+
+        ys = bs(indices, offsets)
+        yscache = bscache(indices, offsets)
+        # Due to different atomicAdd(..) updates, etc, these can differ.
+
+        torch.testing.assert_allclose(ys.view(B, D), yscache.view(B, D), atol=1e-3, rtol=1e-4)
+        go = torch.randn_like(ys)
+        ys.backward(go)
+        yscache.backward(go.view(B, D))
+
+        lxu_flush_weights = bscache.embedding_weights.detach().clone()
+        table_batched_embeddings.lxu_cache_flush(lxu_flush_weights, bscache.lxu_cache_state, bscache.lxu_cache_weights, 32)
+        torch.testing.assert_allclose(lxu_flush_weights, bs.embedding_weights.view(E, D), atol=1e-3, rtol=1e-4)
+        print(bscache.lxu_cache_state[1, :, :])
