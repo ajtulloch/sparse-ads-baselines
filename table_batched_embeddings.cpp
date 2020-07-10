@@ -89,6 +89,8 @@ void lxu_cache_backward_sgd_exact_cuda(Tensor grad_output, Tensor weights,
                                        float learning_rate,
                                        int64_t B_block_size);
 
+std::pair<Tensor, Tensor> lxu_cache_unique_indices_cuda(Tensor indices);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     m.def("forward", &batched_embedding_forward_cuda);
@@ -112,4 +114,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("lxu_cache_backward_sgd", &lxu_cache_backward_sgd_cuda);
     m.def("lxu_cache_backward_sgd_exact", &lxu_cache_backward_sgd_exact_cuda);
     m.def("lxu_cache_flush", &lxu_cache_flush_cuda);
+    m.def("lxu_cache_unique_indices", &lxu_cache_unique_indices_cuda);
 }

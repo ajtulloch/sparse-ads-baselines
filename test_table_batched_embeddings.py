@@ -751,3 +751,18 @@ def test_lxu_cache_forward_backward(C, D, B, L, iters):
         table_batched_embeddings.lxu_cache_flush(lxu_flush_weights, bscache.lxu_cache_state, bscache.lxu_cache_weights, 32)
         torch.testing.assert_allclose(lxu_flush_weights, bs.embedding_weights.view(E, D), atol=1e-3, rtol=1e-4)
         print(bscache.lxu_cache_state[1, :, :])
+
+
+
+@given(
+    st.integers(min_value=1, max_value=64),
+    st.integers(min_value=1, max_value=20),
+)
+@settings(verbosity=Verbosity.verbose, deadline=None, max_examples=20)
+def test_lxu_cache_unique_indices(B, L):
+    E = int(1e6)
+    xs = torch.randint(low=0, high=E, size=(B * L,)).cuda().int()
+    (unique_xs, unique_xs_count) = table_batched_embeddings.lxu_cache_unique_indices(xs)
+    uniqued = unique_xs[:unique_xs_count[0]]
+    assert set(np.unique(xs.cpu().numpy()).tolist()) == set(uniqued.cpu().numpy().tolist())
+

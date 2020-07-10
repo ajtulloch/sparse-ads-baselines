@@ -20,6 +20,7 @@ class LookupFunction(torch.autograd.Function):
         learning_rate,
         eps,
         stochastic_rounding,
+        managed
     ):
         import table_batched_embeddings
 
@@ -27,6 +28,7 @@ class LookupFunction(torch.autograd.Function):
         ctx.learning_rate = learning_rate
         ctx.eps = eps
         ctx.stochastic_rounding = stochastic_rounding
+        ctx.managed = managed
         ctx.save_for_backward(
             weights,
             table_offsets,
@@ -69,29 +71,31 @@ class LookupFunction(torch.autograd.Function):
         if ctx.optimizer == Optimizer.SGD:
             BT_block_size = int(max(256 / weights.shape[1], 1))
             assert per_sample_weights is None
-            # grad_per_sample_weight = table_batched_embeddings.backward_sgd(
-            #     grad_output,
-            #     weights,
-            #     table_offsets,
-            #     indices,
-            #     offsets,
-            #     ctx.learning_rate,
-            #     L_max,
-            #     BT_block_size,
-            #     False,  # shared mem
-            # )
-            grad_per_sample_weight = table_batched_embeddings.backward_exact_sgd(
-                grad_output,
-                weights,
-                table_offsets,
-                indices,
-                offsets,
-                None,
-                ctx.learning_rate,
-                #L_max,
-                BT_block_size,
-                #False,  # shared mem
-            )
+            if ctx.managed == EmbeddingLocation.DEVICE:
+                grad_per_sample_weight = table_batched_embeddings.backward_sgd(
+                    grad_output,
+                    weights,
+                    table_offsets,
+                    indices,
+                    offsets,
+                    ctx.learning_rate,
+                    L_max,
+                    BT_block_size,
+                    False,  # shared mem
+                )
+            else:
+                grad_per_sample_weight = table_batched_embeddings.backward_exact_sgd(
+                    grad_output,
+                    weights,
+                    table_offsets,
+                    indices,
+                    offsets,
+                    None,
+                    ctx.learning_rate,
+                    #L_max,
+                    BT_block_size,
+                    #False,  # shared mem
+                )
 
         elif ctx.optimizer == Optimizer.APPROX_ROWWISE_ADAGRAD:
             BT_block_size = 1
@@ -135,6 +139,7 @@ class LookupFunction(torch.autograd.Function):
             None,
             None,
             None,
+            None,
         )
 
 
@@ -164,8 +169,8 @@ class TableBatchedEmbeddingBags(nn.Module):
         managed=EmbeddingLocation.DEVICE,
     ):
         import table_batched_embeddings
-
         super(TableBatchedEmbeddingBags, self).__init__()
+        self.managed = managed
         if managed == EmbeddingLocation.DEVICE:
             logging.info("Allocating device embedding bag")
             embedding_data = torch.randn(
@@ -231,6 +236,7 @@ class TableBatchedEmbeddingBags(nn.Module):
             self.learning_rate,
             self.eps,
             self.stochastic_rounding,
+            self.managed
         )
 
 
@@ -492,10 +498,12 @@ class LXUCacheLookupFunction(torch.autograd.Function):
         offsets,
         learning_rate,
         t,
+        pipelined,
     ):
         import table_batched_embeddings
-
+        ctx.pipelined = pipelined
         ctx.learning_rate = learning_rate
+        ctx.t = t
         if os.getenv('LXU_CACHE_PROFILE'):
             lxu_cache_locations = table_batched_embeddings.lxu_cache_lookup(
                 indices, lxu_cache_state, t, 32
@@ -503,9 +511,10 @@ class LXUCacheLookupFunction(torch.autograd.Function):
             print(
                 f"Cache hit rate pre-population on iteration {t}: {np.count_nonzero(lxu_cache_locations.cpu().numpy() != NOT_FOUND) / lxu_cache_locations.numel() * 100:.2f}%, {np.count_nonzero(lxu_cache_locations.cpu().numpy() == NOT_FOUND)} misses"
             )
-        table_batched_embeddings.lxu_cache_populate(
-            weights, indices, lxu_cache_state, lxu_cache_weights, t, 32,
-        )
+        if not pipelined:
+            table_batched_embeddings.lxu_cache_populate(
+                weights, indices, lxu_cache_state, lxu_cache_weights, t, 32,
+            )
         lxu_cache_locations = table_batched_embeddings.lxu_cache_lookup(
             indices, lxu_cache_state, t, 32
         )
@@ -542,6 +551,12 @@ class LXUCacheLookupFunction(torch.autograd.Function):
             offsets,
             lxu_cache_locations,
         ) = ctx.saved_tensors
+        if ctx.pipelined:
+            # birthday paradox #guarantee's if we do single-stage pipelining we won't get regressions.
+            pass
+            # lxu_cache_locations = table_batched_embeddings.lxu_cache_lookup(
+            #     indices, lxu_cache_state, ctx.t, 32
+            # )
         table_batched_embeddings.lxu_cache_backward_sgd(
             grad_output,
             weights,
@@ -554,6 +569,7 @@ class LXUCacheLookupFunction(torch.autograd.Function):
         )
         return (
             torch.cuda.sparse.FloatTensor(*weights.size()),
+            None,
             None,
             None,
             None,
@@ -599,7 +615,14 @@ class LXUCacheEmbeddingBag(nn.Module):
         self.t = 1
         self.learning_rate = learning_rate
 
-    def forward(self, indices, offsets):
+    def prefetch(self, indices):
+        import table_batched_embeddings
+        self.t += 1
+        table_batched_embeddings.lxu_cache_populate(
+            self.embedding_weights, indices, self.lxu_cache_state, self.lxu_cache_weights, self.t, 32,
+        )
+
+    def forward(self, indices, offsets, pipelined=False):
         self.t += 1
         return LXUCacheLookupFunction.apply(
             self.embedding_weights,
@@ -609,5 +632,6 @@ class LXUCacheEmbeddingBag(nn.Module):
             offsets,
             self.learning_rate,
             self.t,
+            pipelined,
         )
 

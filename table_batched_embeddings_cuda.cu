@@ -1967,6 +1967,77 @@ Tensor restack_offsets(Tensor stack_offset_output,  // [W][T][B]
 
 inline int32_t div_round_up(int32_t a, int32_t b) { return (a + b - 1) / b; }
 
+// 32 bit Murmur3 hash
+DEVICE_INLINE uint32_t Murmur3(uint32_t k) {
+  k ^= k >> 16;
+  k *= 0x85ebca6b;
+  k ^= k >> 13;
+  k *= 0xc2b2ae35;
+  k ^= k >> 16;
+  return k;
+}
+
+constexpr int32_t kCuckooMissing = -1;
+
+__global__ void cuckoo_insert(
+    const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits> indices,
+    PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits> cuckoo_keys) {
+  unsigned int n = blockIdx.x * blockDim.x + threadIdx.x;
+  if (n >= indices.size(0)) {
+    return;
+  }
+  int32_t key = indices[n];
+  uint32_t slot = Murmur3(key) % cuckoo_keys.size(0);
+
+  while (true) {
+    int32_t prev = atomicCAS(&cuckoo_keys[slot], kCuckooMissing, key);
+    if (prev == kCuckooMissing || prev == key) {
+      return;
+    }
+    slot = (slot + 1) % cuckoo_keys.size(0);
+  }
+}
+
+__global__ void cuckoo_unique_keys(
+    const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits> cuckoo_keys,
+    PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits> unique_indices,
+    PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits>
+        unique_indices_count) {
+  unsigned int n = blockIdx.x * blockDim.x + threadIdx.x;
+  if (n >= cuckoo_keys.size(0)) {
+    return;
+  }
+
+  int32_t key = cuckoo_keys[n];
+  if (key != kCuckooMissing) {
+    unique_indices[atomicAdd(&unique_indices_count[0], 1)] = key;
+  }
+}
+
+std::pair<Tensor, Tensor> lxu_cache_unique_indices_cuda(Tensor indices) {
+  at::cuda::OptionalCUDAGuard device_guard;
+  device_guard.set_index(indices.get_device());
+  auto cuckoo_keys =
+      at::empty({indices.size(0) * 4}, indices.options()).fill_(kCuckooMissing);
+  auto unique_indices = at::empty_like(indices);
+
+  cuckoo_insert<<<dim3(div_round_up(indices.numel(), kMaxThreads)), kMaxThreads,
+                  0, at::cuda::getCurrentCUDAStream()>>>(
+      indices.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
+      cuckoo_keys.packed_accessor32<int32_t, 1, RestrictPtrTraits>());
+
+  auto unique_indices_count = at::zeros({1}, indices.options().dtype(kInt));
+
+  cuckoo_unique_keys<<<dim3(div_round_up(cuckoo_keys.numel(), kMaxThreads)),
+                       kMaxThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
+      cuckoo_keys.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
+      unique_indices.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
+      unique_indices_count.packed_accessor32<int32_t, 1, RestrictPtrTraits>());
+
+  AT_CUDA_CHECK(cudaGetLastError());
+  return std::make_pair(unique_indices, unique_indices_count);
+}
+
 constexpr int32_t kCacheSlotTime = 0;
 constexpr int32_t kCacheSlotFreq = 1;
 constexpr int32_t kCacheSlotCurrentIndex = 2;
@@ -2058,8 +2129,7 @@ __global__ void batched_embedding_forward_kernel_lxu_cache_find_uncached(
   auto idx = unique_indices[n];
   int32_t cache_set = hash_function(idx) % C;
   auto slot = threadIdx.x;
-  bool found = lxu_cache_state[kCacheSlotTime][cache_set][slot] > 0 &&
-               lxu_cache_state[kCacheSlotCurrentIndex][cache_set][slot] == idx;
+  bool found = lxu_cache_state[kCacheSlotCurrentIndex][cache_set][slot] == idx;
   // pre-condition - only one thread can satisfy this check.
   if (__any_sync(0xFFFFFFFF, found)) {
     if (threadIdx.x == 0) {
@@ -2075,7 +2145,6 @@ __global__ void batched_embedding_forward_kernel_lxu_cache_find_uncached(
 // Warp bitonic K/V sorting code from @jhj
 template <typename T> struct Comparator {
   __device__ static inline bool lt(T a, T b) { return a < b; }
-
   __device__ static inline bool gt(T a, T b) { return a > b; }
 };
 
@@ -2151,7 +2220,7 @@ template <typename K, typename V, bool Dir, typename Comp> struct BitonicSort {
 template <typename scalar_t>
 __global__ void batched_embedding_forward_kernel_lxu_cache_insert_uncached(
     PackedTensorAccessor32<int32_t, 3, RestrictPtrTraits> lxu_cache_state,
-    PackedTensorAccessor32<scalar_t, 2, RestrictPtrTraits> lxu_cache_weights,
+    PackedTensorAccessor64<scalar_t, 2, RestrictPtrTraits> lxu_cache_weights,
     PackedTensorAccessor64<scalar_t, 2, RestrictPtrTraits> weights,
     const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits>
         sorted_cache_sets, // [N = \sum_{b} L_{b} total indices, i.e.
@@ -2162,8 +2231,11 @@ __global__ void batched_embedding_forward_kernel_lxu_cache_insert_uncached(
                                   // flattened [B][L]
     int32_t t) {
   const int32_t C = lxu_cache_state.size(1);
+
   const int32_t N = sorted_cache_sets.size(0);
   const int32_t D = weights.size(1);
+  assert(lxu_cache_weights.size(0) == C * kAssoc);
+  assert(lxu_cache_weights.size(1) == D);
   int32_t n = blockIdx.x * blockDim.y + threadIdx.y;
   if (n >= N) {
     return;
@@ -2202,6 +2274,7 @@ __global__ void batched_embedding_forward_kernel_lxu_cache_insert_uncached(
   BitonicSort<int32_t, int32_t, 1, Comparator<int32_t>>::sort(costs, slots);
   const int32_t sorted_slot = slots[0];
 
+#pragma unroll
   for (int32_t l = 0; l < min(SL, kWarpSize); ++l) {
     const int32_t insert_slot = __shfl_sync(0xFFFFFFFF, sorted_slot, l);
     const int32_t insert_slot_time =
@@ -2216,16 +2289,15 @@ __global__ void batched_embedding_forward_kernel_lxu_cache_insert_uncached(
           lxu_cache_state[kCacheSlotCurrentIndex][cache_set][insert_slot];
       for (int32_t d = threadIdx.x; d * 4 < D; d += blockDim.x) {
         Vec4T<scalar_t>::copy(
-            &lxu_cache_weights[cache_set * kAssoc + insert_slot][d * 4],
-            &weights[current_idx][d * 4]);
+            (&lxu_cache_weights[cache_set * kAssoc + insert_slot][0]) + d * 4,
+            (&weights[current_idx][0]) + d * 4);
       }
     }
     const int32_t insert_idx = cache_set_sorted_indices[n + l];
-    assert(hash_function(insert_idx) % C == cache_set);
     for (int32_t d = threadIdx.x; d * 4 < D; d += blockDim.x) {
       Vec4T<scalar_t>::copy(
-          &weights[insert_idx][d * 4],
-          &lxu_cache_weights[cache_set * kAssoc + insert_slot][d * 4]);
+          (&weights[insert_idx][0]) + d * 4,
+          (&lxu_cache_weights[cache_set * kAssoc + insert_slot][0]) + d * 4);
     }
     if (threadIdx.x == 0) {
       lxu_cache_state[kCacheSlotCurrentIndex][cache_set][insert_slot] =
@@ -2328,49 +2400,54 @@ void lxu_cache_populate_cuda(Tensor weights, Tensor indices,
   at::cuda::OptionalCUDAGuard device_guard;
   device_guard.set_index(indices.get_device());
   const int32_t N = indices.numel();
-  auto sorted_indices = empty_like(indices);
-  // Step 1: sort indices
-  {
-    size_t temp_storage_bytes = 0;
-    AT_CUDA_CHECK(cub::DeviceRadixSort::SortKeys(
-        nullptr, temp_storage_bytes, (uint32_t *)indices.data_ptr(),
-        (uint32_t *)sorted_indices.data_ptr(), N, 0,
-        int(log2(weights.size(0)) + 1), at::cuda::getCurrentCUDAStream(),
-        false));
+  // auto sorted_indices = empty_like(indices);
+  // // Step 1: sort indices
+  // {
+  //   size_t temp_storage_bytes = 0;
+  //   AT_CUDA_CHECK(cub::DeviceRadixSort::SortKeys(
+  //       nullptr, temp_storage_bytes, (uint32_t *)indices.data_ptr(),
+  //       (uint32_t *)sorted_indices.data_ptr(), N, 0,
+  //       int(log2(weights.size(0)) + 1), at::cuda::getCurrentCUDAStream(),
+  //       false));
 
-    auto temp_storage = at::empty({static_cast<int64_t>(temp_storage_bytes)},
-                                  indices.options().dtype(kByte));
-    AT_CUDA_CHECK(cub::DeviceRadixSort::SortKeys(
-        temp_storage.data_ptr(), temp_storage_bytes,
-        (uint32_t *)indices.data_ptr(), (uint32_t *)sorted_indices.data_ptr(),
-        N, 0, int(log2(weights.size(0)) + 1), at::cuda::getCurrentCUDAStream(),
-        false));
-  }
+  //   auto temp_storage = at::empty({static_cast<int64_t>(temp_storage_bytes)},
+  //                                 indices.options().dtype(kByte));
+  //   AT_CUDA_CHECK(cub::DeviceRadixSort::SortKeys(
+  //       temp_storage.data_ptr(), temp_storage_bytes,
+  //       (uint32_t *)indices.data_ptr(), (uint32_t
+  //       *)sorted_indices.data_ptr(),
+  //       N, 0, int(log2(weights.size(0)) + 1),
+  //       at::cuda::getCurrentCUDAStream(),
+  //       false));
+  // }
   // std::cout << sorted_indices << std::endl;
   // Step 2: find unique indices
-  auto unique_indices = empty_like(indices);
-  auto unique_indices_count = empty({1}, indices.options().dtype(kInt));
+  // auto unique_indices = empty_like(indices);
+  // auto unique_indices_count = empty({1}, indices.options().dtype(kInt));
 
-  {
-    size_t temp_storage_bytes = 0;
-    AT_CUDA_CHECK(cub::DeviceSelect::Unique(
-        nullptr, temp_storage_bytes, (int32_t *)sorted_indices.data_ptr(),
-        (int32_t *)unique_indices.data_ptr(),
-        (int32_t *)unique_indices_count.data_ptr(), N,
-        at::cuda::getCurrentCUDAStream(), false));
+  auto unique_indices_and_count = lxu_cache_unique_indices_cuda(indices);
+  auto unique_indices = unique_indices_and_count.first;
+  auto unique_indices_count = unique_indices_and_count.second;
 
-    auto temp_storage = at::empty({static_cast<int64_t>(temp_storage_bytes)},
-                                  indices.options().dtype(kByte));
-    AT_CUDA_CHECK(
-        cub::DeviceSelect::Unique(temp_storage.data_ptr(), temp_storage_bytes,
-                                  (int32_t *)sorted_indices.data_ptr(),
-                                  (int32_t *)unique_indices.data_ptr(),
-                                  (int32_t *)unique_indices_count.data_ptr(), N,
-                                  at::cuda::getCurrentCUDAStream(), false));
-  }
-  // std::cout << unique_indices << std::endl;
-  // std::cout << unique_indices_count << std::endl;
+  // {
+  //   size_t temp_storage_bytes = 0;
+  //   AT_CUDA_CHECK(cub::DeviceSelect::Unique(
+  //       nullptr, temp_storage_bytes, (int32_t *)sorted_indices.data_ptr(),
+  //       (int32_t *)unique_indices.data_ptr(),
+  //       (int32_t *)unique_indices_count.data_ptr(), N,
+  //       at::cuda::getCurrentCUDAStream(), false));
 
+  //   auto temp_storage = at::empty({static_cast<int64_t>(temp_storage_bytes)},
+  //                                 indices.options().dtype(kByte));
+  //   AT_CUDA_CHECK(
+  //       cub::DeviceSelect::Unique(temp_storage.data_ptr(),
+  //       temp_storage_bytes,
+  //                                 (int32_t *)sorted_indices.data_ptr(),
+  //                                 (int32_t *)unique_indices.data_ptr(),
+  //                                 (int32_t *)unique_indices_count.data_ptr(),
+  //                                 N,
+  //                                 at::cuda::getCurrentCUDAStream(), false));
+  // }
   // Step 3: find uncached indices
   auto cache_sets = empty_like(indices);
   {
@@ -2383,10 +2460,7 @@ void lxu_cache_populate_cuda(Tensor weights, Tensor indices,
         cache_sets.packed_accessor32<int32_t, 1, RestrictPtrTraits>());
     AT_CUDA_CHECK(cudaGetLastError());
   }
-  // std::cout << cache_sets << std::endl;
-
   // Step 4: sort the cache sets and ids
-
   auto sorted_cache_sets = empty_like(cache_sets);
   auto cache_set_sorted_unique_indices = empty_like(unique_indices);
 
@@ -2421,7 +2495,7 @@ void lxu_cache_populate_cuda(Tensor weights, Tensor indices,
             at::cuda::getCurrentCUDAStream()>>>(
             lxu_cache_state.packed_accessor32<int32_t, 3, RestrictPtrTraits>(),
             lxu_cache_weights
-                .packed_accessor32<scalar_t, 2, RestrictPtrTraits>(),
+                .packed_accessor64<scalar_t, 2, RestrictPtrTraits>(),
             weights.packed_accessor64<scalar_t, 2, RestrictPtrTraits>(),
             sorted_cache_sets
                 .packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
@@ -2462,7 +2536,7 @@ __global__ void lxu_cache_forward_kernel_1(
         offsets, // [B + 1]
     const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits>
         lxu_cache_locations, // [N]
-    const PackedTensorAccessor32<scalar_t, 2, RestrictPtrTraits>
+    const PackedTensorAccessor64<scalar_t, 2, RestrictPtrTraits>
         lxu_cache_weights, // [N]
 
     PackedTensorAccessor32<scalar_t, 2, RestrictPtrTraits>
@@ -2520,7 +2594,7 @@ Tensor lxu_cache_forward_cuda(Tensor weights, Tensor indices, Tensor offsets,
       indices.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),              \
       offsets.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),              \
       lxu_cache_locations.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),  \
-      lxu_cache_weights.packed_accessor32<scalar_t, 2, RestrictPtrTraits>(),   \
+      lxu_cache_weights.packed_accessor64<scalar_t, 2, RestrictPtrTraits>(),   \
       output.packed_accessor32<scalar_t, 2, RestrictPtrTraits>(), (functor))
 
   auto output = empty({B, D}, lxu_cache_weights.options());
@@ -2546,7 +2620,7 @@ template <typename scalar_t>
 __global__ void lxu_cache_flush_kernel_1(
     PackedTensorAccessor64<scalar_t, 2, RestrictPtrTraits> weights,
     PackedTensorAccessor32<int32_t, 3, RestrictPtrTraits> lxu_cache_state,
-    PackedTensorAccessor32<scalar_t, 2, RestrictPtrTraits> lxu_cache_weights) {
+    PackedTensorAccessor64<scalar_t, 2, RestrictPtrTraits> lxu_cache_weights) {
   const auto D = lxu_cache_weights.size(1);
   const auto B = lxu_cache_weights.size(0);
 
@@ -2586,7 +2660,7 @@ void lxu_cache_flush_cuda(Tensor weights, Tensor lxu_cache_state,
             weights.packed_accessor64<scalar_t, 2, RestrictPtrTraits>(),
             lxu_cache_state.packed_accessor32<int32_t, 3, RestrictPtrTraits>(),
             lxu_cache_weights
-                .packed_accessor32<scalar_t, 2, RestrictPtrTraits>());
+                .packed_accessor64<scalar_t, 2, RestrictPtrTraits>());
       }));
 
 #undef X
@@ -2602,7 +2676,7 @@ __global__ void lxu_cache_backward_sgd_kernel_1(
     const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits> offsets,
     const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits>
         lxu_cache_locations,
-    PackedTensorAccessor32<scalar_t, 2, RestrictPtrTraits> lxu_cache_weights,
+    PackedTensorAccessor64<scalar_t, 2, RestrictPtrTraits> lxu_cache_weights,
     F f) {
 
   const int32_t B = grad_output.size(0);
@@ -2657,13 +2731,12 @@ void lxu_cache_backward_sgd_cuda(Tensor grad_output, Tensor weights,
             lxu_cache_locations
                 .packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
             lxu_cache_weights
-                .packed_accessor32<scalar_t, 2, RestrictPtrTraits>(),
+                .packed_accessor64<scalar_t, 2, RestrictPtrTraits>(),
             SGDFunctor<scalar_t, true>(learning_rate));
       }));
   AT_CUDA_CHECK(cudaGetLastError());
   return;
 }
-
 
 template <typename scalar_t, typename F>
 __global__ void lxu_cache_backward_sgd_exact_kernel_1(
@@ -2673,10 +2746,10 @@ __global__ void lxu_cache_backward_sgd_exact_kernel_1(
     const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits> offsets,
     const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits>
         sorted_linear_indices,
-    const IndexInfo *__restrict__ infos, 
+    const IndexInfo *__restrict__ infos,
     const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits>
         lxu_cache_locations,
-    PackedTensorAccessor32<scalar_t, 2, RestrictPtrTraits> lxu_cache_weights,
+    PackedTensorAccessor64<scalar_t, 2, RestrictPtrTraits> lxu_cache_weights,
     F f) {
   const int32_t B = grad_output.size(0);
   const int32_t T = 1; // grad_output.size(1);
@@ -2711,7 +2784,7 @@ __global__ void lxu_cache_backward_sgd_exact_kernel_1(
   // table (`idx`). Thus, we can hoist out some of the book-keeping.
   auto info_0 = infos[sorted_linear_indice_id];
   const int32_t t = info_0.b_t / B;
-  const int64_t table_offset = 0; //table_offsets[t];
+  const int64_t table_offset = 0; // table_offsets[t];
   const int32_t idx = linear_index - table_offset;
   const int32_t cache_idx = lxu_cache_locations[info_0.indices_idx];
 
@@ -2809,7 +2882,7 @@ void lxu_cache_backward_sgd_exact_cuda(Tensor grad_output, Tensor weights,
             lxu_cache_locations
                 .packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
             lxu_cache_weights
-                .packed_accessor32<scalar_t, 2, RestrictPtrTraits>(),
+                .packed_accessor64<scalar_t, 2, RestrictPtrTraits>(),
             SGDFunctor<scalar_t, false>(learning_rate));
       }));
   AT_CUDA_CHECK(cudaGetLastError());

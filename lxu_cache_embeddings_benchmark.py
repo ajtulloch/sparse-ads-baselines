@@ -5,6 +5,7 @@ import logging
 
 import sys
 import torch
+import json
 import table_batched_embeddings_ops
 
 logging.basicConfig(level=logging.DEBUG)
@@ -152,6 +153,13 @@ def benchmark_microbenchmark(B, E, L, D, C, iters, fp16, managed, mixed):
     lxu_cache_weights = torch.zeros(C * ASSOC, D).float().cuda()
 
     for N_block_size in [32]:
+        time_per_iter = benchmark_torch_function(
+            iters, table_batched_embeddings.lxu_cache_unique_indices, indices,
+        )
+        logging.info(
+            f"LRU Unique, random values, B: {B} {(N_block_size,)}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {(2 if fp16 else 4) * B * T * L * D / time_per_iter / 1.0e9: .2f}GB/s, T: {time_per_iter * 1.0e6:.0f}us"
+        )
+
         lxu_cache_state = torch.zeros(3, C, ASSOC).int().cuda()
         time_per_iter = benchmark_torch_function(
             iters,
@@ -300,12 +308,21 @@ def generate_requests(iters, B, L, E, inter_request_reuse, alpha):
         )
         all_indices[it + 1, reused_indices] = all_indices[it, reused_indices]
 
-    average_intra_request_shared = np.average([
-        1 - (np.unique(all_indices[it]).size / all_indices[it].size) for it in range(iters)
-    ])
-    average_inter_request_shared = np.average([
-        np.intersect1d(all_indices[it], all_indices[it+1]).size / np.unique(np.concatenate([all_indices[it+1], all_indices[it]])).size for it in range(iters-1)
-    ])
+    average_intra_request_shared = np.average(
+        [
+            1 - (np.unique(all_indices[it]).size / all_indices[it].size)
+            for it in range(iters)
+        ]
+    )
+    average_inter_request_shared = np.average(
+        [
+            np.intersect1d(all_indices[it], all_indices[it + 1]).size
+            / np.unique(
+                np.concatenate([all_indices[it + 1], all_indices[it]])
+            ).size
+            for it in range(iters - 1)
+        ]
+    )
     print(
         f"intra-request shared: {average_intra_request_shared * 100:.1f}%, inter-request shared: {average_inter_request_shared * 100:.1f}%"
     )
@@ -314,7 +331,7 @@ def generate_requests(iters, B, L, E, inter_request_reuse, alpha):
         get_table_batched_offsets_from_dense(all_indices[it].view(1, B, L))
         for it in range(iters)
     ]
-    return rs
+    return rs, average_intra_request_shared, average_inter_request_shared
 
 
 def benchmark_e2e(B, E, L, D, C, iters, inter_request_reuse, alpha):
@@ -334,28 +351,34 @@ def benchmark_e2e(B, E, L, D, C, iters, inter_request_reuse, alpha):
         managed=table_batched_embeddings_ops.EmbeddingLocation.HOST_MAPPED,
         eps=0.1,
     ).cuda()
-
-    # emb_gpu = table_batched_embeddings_ops.TableBatchedEmbeddingBags(
-    #     T,
-    #     E,
-    #     D,
-    #     optimizer=table_batched_embeddings_ops.Optimizer.SGD,
-    #     learning_rate=0.1,
-    #     managed=table_batched_embeddings_ops.EmbeddingLocation.DEVICE,
-    #     eps=0.1,
-    # ).cuda()
-    emb_gpu = None
-    lxu_emb = table_batched_embeddings_ops.LXUCacheEmbeddingBag(1, D, C,).cuda()
-    lxu_emb.embedding_weights = emb.embedding_weights
+    try:
+        emb_gpu = table_batched_embeddings_ops.TableBatchedEmbeddingBags(
+            T,
+            E,
+            D,
+            optimizer=table_batched_embeddings_ops.Optimizer.SGD,
+            learning_rate=0.1,
+            managed=table_batched_embeddings_ops.EmbeddingLocation.DEVICE,
+            eps=0.1,
+        ).cuda()
+    except:
+        emb_gpu = None
+    lxu_emb = table_batched_embeddings_ops.LXUCacheEmbeddingBag(E, D, C,).cuda()
+    print(lxu_emb.lxu_cache_weights.device)
+    assert lxu_emb.lxu_cache_weights.shape == (C * 32, D)
+    # lxu_emb.embedding_weights = emb.embedding_weights
 
     logging.info(
         f"Embedding parameters: {emb.embedding_weights.numel() / 1.0e9:.2f}GParam"
     )
 
-    requests = generate_requests(2 * iters, B, L, E, inter_request_reuse, alpha)
+    requests, average_intra_request_shared, average_inter_request_shared = generate_requests(2 * iters, B, L, E, inter_request_reuse, alpha)
     warmup_requests, requests = requests[:iters], requests[iters:]
     for indices, offsets in warmup_requests:
         lxu_emb(indices, offsets)
+        emb(indices, offsets)
+        if emb_gpu:
+            emb_gpu(indices, offsets)
 
     def benchmark_requests(f):
         torch.cuda.synchronize()
@@ -367,6 +390,29 @@ def benchmark_e2e(B, E, L, D, C, iters, inter_request_reuse, alpha):
         end_event.record()
         torch.cuda.synchronize()
         return (start_event.elapsed_time(end_event) * 1.0e-3) / len(requests)
+
+    def benchmark_pipelined_requests(f, g):
+        torch.cuda.synchronize()
+        start_events = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) for _ in requests]
+        end_events = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) for _ in requests]
+        for ((indices, offsets), start_event, end_event) in zip(
+            requests, start_events, end_events
+        ):
+            start_event[0].record()
+            f(indices, offsets)
+            end_event[0].record()
+            start_event[1].record()
+            g(indices, offsets)
+            end_event[1].record()
+        torch.cuda.synchronize()
+        return sum(
+            start_event[0].elapsed_time(end_event[0]) * 1.0e-3
+            for start_event, end_event in zip(start_events, end_events)
+        ) / len(requests), sum(
+            start_event[1].elapsed_time(end_event[1]) * 1.0e-3
+            for start_event, end_event in zip(start_events, end_events)
+        ) / len(requests)
+
 
     # time_per_iter = benchmark_requests(
     #     lambda indices, offsets: emb(indices, offsets)
@@ -393,8 +439,25 @@ def benchmark_e2e(B, E, L, D, C, iters, inter_request_reuse, alpha):
         )
     )
     logging.info(
-        f"ForwardBackward (Managed), irr: {inter_request_reuse}, alpha: {alpha}, B: {B}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {3 * (2 if fp16 else 4) * B * T * L * D / time_per_iter / 1.0e9: .2f}GB/s, T: {time_per_iter * 1.0e6:.0f}us"
+        f"ForwardBackward (Managed), irr: {inter_request_reuse}, alpha: {alpha}, B: {B}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {(3 * L + 2)  * (2 if fp16 else 4) * B * T * D / time_per_iter / 1.0e9: .2f}GB/s, T: {time_per_iter * 1.0e6:.0f}us"
     )
+    print(json.dumps(dict(
+        method="Host-Mapped",
+        task="ForwardBackward",
+        alpha=alpha,
+        inter_request_reuse=inter_request_reuse,
+        average_intra_request_shared=average_intra_request_shared,
+        average_inter_request_shared=average_inter_request_shared,
+        B=B,
+        E=E,
+        C=C,
+        D=D,
+        L=L,
+        BW=(3 * L + 2) * (2 if fp16 else 4) * B * T * D / time_per_iter,
+        T=time_per_iter,
+        T_pipe=0,
+    )))
+
     if emb_gpu:
         time_per_iter = benchmark_requests(
             lambda indices, offsets: emb_gpu(indices, offsets).backward(
@@ -402,14 +465,77 @@ def benchmark_e2e(B, E, L, D, C, iters, inter_request_reuse, alpha):
             )
         )
         logging.info(
-            f"ForwardBackward (GPU), irr: {inter_request_reuse}, alpha: {alpha}, B: {B}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {3 * (2 if fp16 else 4) * B * T * L * D / time_per_iter / 1.0e9: .2f}GB/s, T: {time_per_iter * 1.0e6:.0f}us"
+            f"ForwardBackward (GPU), irr: {inter_request_reuse}, alpha: {alpha}, B: {B}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {(3 * L + 2)  * (2 if fp16 else 4) * B * T  * D / time_per_iter / 1.0e9: .2f}GB/s, T: {time_per_iter * 1.0e6:.0f}us"
         )
+        print(json.dumps(dict(
+            method="Device",
+            task="ForwardBackward",
+            alpha=alpha,
+            inter_request_reuse=inter_request_reuse,
+            average_intra_request_shared=average_intra_request_shared,
+            average_inter_request_shared=average_inter_request_shared,
+            B=B,
+            E=E,
+            C=C,
+            D=D,
+            L=L,
+            BW=(3 * L + 2) * (2 if fp16 else 4) * B * T * D / time_per_iter,
+            T=time_per_iter,
+            T_pipe=0,
+        )))
+    # use the pre-specified
+    lxu_cache_state = lxu_emb.lxu_cache_state.clone()
+    lxu_cache_weights = lxu_emb.lxu_cache_weights.clone()
+
     time_per_iter = benchmark_requests(
         lambda indices, offsets: lxu_emb(indices, offsets).backward(grad_out)
     )
     logging.info(
-        f"ForwardBackward (LRU), irr: {inter_request_reuse}, alpha: {alpha}, B: {B}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {3 * (2 if fp16 else 4) * B * T * L * D / time_per_iter / 1.0e9: .2f}GB/s, T: {time_per_iter * 1.0e6:.0f}us"
+        f"ForwardBackward (LRU), irr: {inter_request_reuse}, alpha: {alpha}, B: {B}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {(3 * L + 2) * (2 if fp16 else 4) * B * T * D / time_per_iter / 1.0e9: .2f}GB/s, T: {time_per_iter * 1.0e6:.0f}us"
     )
+    print(json.dumps(dict(
+        method="LRU",
+        task="ForwardBackward",
+        alpha=alpha,
+        inter_request_reuse=inter_request_reuse,
+        average_intra_request_shared=average_intra_request_shared,
+        average_inter_request_shared=average_inter_request_shared,
+        B=B,
+        E=E,
+        C=C,
+        D=D,
+        L=L,
+        BW=(3 * L + 2) * (2 if fp16 else 4) * B * T * D / time_per_iter,
+        T=time_per_iter,
+        T_pipe=0,
+    )))
+
+    lxu_emb.lxu_cache_state = lxu_cache_state
+    lxu_emb.lxu_cache_weights = lxu_cache_weights
+
+    pipeline_time_per_iter, time_per_iter = benchmark_pipelined_requests(
+        lambda indices, offsets: lxu_emb.prefetch(indices),
+        lambda indices, offsets: lxu_emb(indices, offsets).backward(grad_out)
+    )
+    logging.info(
+        f"ForwardBackward (LRU, Prefetched), irr: {inter_request_reuse}, alpha: {alpha}, B: {B}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {(3 * L + 2) * (2 if fp16 else 4) * B * T * D / time_per_iter / 1.0e9: .2f}GB/s, T: {time_per_iter * 1.0e6:.0f}, Tpipe: {pipeline_time_per_iter * 1.0e6:.0f}us"
+    )
+    print(json.dumps(dict(
+        method="LRU (Prefetching)",
+        task="ForwardBackward",
+        alpha=alpha,
+        inter_request_reuse=inter_request_reuse,
+        average_intra_request_shared=average_intra_request_shared,
+        average_inter_request_shared=average_inter_request_shared,
+        B=B,
+        E=E,
+        C=C,
+        D=D,
+        L=L,
+        BW=(3 * L + 2) * (2 if fp16 else 4) * B * T * D / time_per_iter,
+        T=time_per_iter,
+        T_pipe=pipeline_time_per_iter,
+    )))
 
 
 @click.group()
@@ -538,5 +664,75 @@ def e2e(
         f()
 
 
+
+@cli.command()
+@click.option("--num-embeddings", default=int(1e7))
+@click.option("--cache-sets", default=int(1e5))
+@click.option("--embedding-dim", default=32)
+@click.option("--batch-size", default=128)
+@click.option("--bag-size", default=32)
+@click.option("--iters", default=100)
+# @click.option("--inter-request-reuse", type=float, default=0.1)
+# @click.option("--alpha", type=float, default=1.000000001)
+@click.option("--remote", is_flag=True, default=False)
+def e2e_report(
+    num_embeddings,
+    cache_sets,
+    embedding_dim,
+    batch_size,
+    bag_size,
+    iters,
+    #inter_request_reuse,
+    #alpha,
+    remote,
+):
+    def f():
+        import torch
+        for inter_request_reuse in [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]:
+            benchmark_e2e(
+                batch_size,
+                num_embeddings,
+                bag_size,
+                embedding_dim,
+                cache_sets,
+                iters,
+                inter_request_reuse,
+                alpha=1.0,
+            )
+
+        for alpha in [1.0, 1.05, 1.1, 1.15]:
+            benchmark_e2e(
+                batch_size,
+                num_embeddings,
+                bag_size,
+                embedding_dim,
+                cache_sets,
+                iters,
+                inter_request_reuse=0.5,
+                alpha=alpha,
+            )
+
+    if remote:
+        import submitit
+
+        executor = submitit.AutoExecutor(folder="sparse_embedding_perf")
+        executor.update_parameters(
+            timeout_min=10,
+            partition="dev",
+            constraint="volta32gb",
+            gpus_per_node=1,
+        )
+        job = executor.submit(f)
+        job.wait()
+        job.result()
+        logging.info("Finished")
+        import time
+
+        time.sleep(1)
+        print(job.stdout())
+        print(job.stderr(), file=sys.stderr)
+        logging.info("Finished")
+    else:
+        f()
 if __name__ == "__main__":
     cli()
