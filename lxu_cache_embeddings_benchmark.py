@@ -372,7 +372,11 @@ def benchmark_e2e(B, E, L, D, C, iters, inter_request_reuse, alpha):
         f"Embedding parameters: {emb.embedding_weights.numel() / 1.0e9:.2f}GParam"
     )
 
-    requests, average_intra_request_shared, average_inter_request_shared = generate_requests(2 * iters, B, L, E, inter_request_reuse, alpha)
+    (
+        requests,
+        average_intra_request_shared,
+        average_inter_request_shared,
+    ) = generate_requests(2 * iters, B, L, E, inter_request_reuse, alpha)
     warmup_requests, requests = requests[:iters], requests[iters:]
     for indices, offsets in warmup_requests:
         lxu_emb(indices, offsets)
@@ -393,8 +397,20 @@ def benchmark_e2e(B, E, L, D, C, iters, inter_request_reuse, alpha):
 
     def benchmark_pipelined_requests(f, g):
         torch.cuda.synchronize()
-        start_events = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) for _ in requests]
-        end_events = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) for _ in requests]
+        start_events = [
+            (
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+            )
+            for _ in requests
+        ]
+        end_events = [
+            (
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+            )
+            for _ in requests
+        ]
         for ((indices, offsets), start_event, end_event) in zip(
             requests, start_events, end_events
         ):
@@ -405,14 +421,18 @@ def benchmark_e2e(B, E, L, D, C, iters, inter_request_reuse, alpha):
             g(indices, offsets)
             end_event[1].record()
         torch.cuda.synchronize()
-        return sum(
-            start_event[0].elapsed_time(end_event[0]) * 1.0e-3
-            for start_event, end_event in zip(start_events, end_events)
-        ) / len(requests), sum(
-            start_event[1].elapsed_time(end_event[1]) * 1.0e-3
-            for start_event, end_event in zip(start_events, end_events)
-        ) / len(requests)
-
+        return (
+            sum(
+                start_event[0].elapsed_time(end_event[0]) * 1.0e-3
+                for start_event, end_event in zip(start_events, end_events)
+            )
+            / len(requests),
+            sum(
+                start_event[1].elapsed_time(end_event[1]) * 1.0e-3
+                for start_event, end_event in zip(start_events, end_events)
+            )
+            / len(requests),
+        )
 
     # time_per_iter = benchmark_requests(
     #     lambda indices, offsets: emb(indices, offsets)
@@ -441,22 +461,26 @@ def benchmark_e2e(B, E, L, D, C, iters, inter_request_reuse, alpha):
     logging.info(
         f"ForwardBackward (Managed), irr: {inter_request_reuse}, alpha: {alpha}, B: {B}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {(3 * L + 2)  * (2 if fp16 else 4) * B * T * D / time_per_iter / 1.0e9: .2f}GB/s, T: {time_per_iter * 1.0e6:.0f}us"
     )
-    print(json.dumps(dict(
-        method="Host-Mapped",
-        task="ForwardBackward",
-        alpha=alpha,
-        inter_request_reuse=inter_request_reuse,
-        average_intra_request_shared=average_intra_request_shared,
-        average_inter_request_shared=average_inter_request_shared,
-        B=B,
-        E=E,
-        C=C,
-        D=D,
-        L=L,
-        BW=(3 * L + 2) * (2 if fp16 else 4) * B * T * D / time_per_iter,
-        T=time_per_iter,
-        T_pipe=0,
-    )))
+    print(
+        json.dumps(
+            dict(
+                method="Host-Mapped",
+                task="ForwardBackward",
+                alpha=alpha,
+                inter_request_reuse=inter_request_reuse,
+                average_intra_request_shared=average_intra_request_shared,
+                average_inter_request_shared=average_inter_request_shared,
+                B=B,
+                E=E,
+                C=C,
+                D=D,
+                L=L,
+                BW=(3 * L + 2) * (2 if fp16 else 4) * B * T * D / time_per_iter,
+                T=time_per_iter,
+                T_pipe=0,
+            )
+        )
+    )
 
     if emb_gpu:
         time_per_iter = benchmark_requests(
@@ -467,22 +491,31 @@ def benchmark_e2e(B, E, L, D, C, iters, inter_request_reuse, alpha):
         logging.info(
             f"ForwardBackward (GPU), irr: {inter_request_reuse}, alpha: {alpha}, B: {B}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {(3 * L + 2)  * (2 if fp16 else 4) * B * T  * D / time_per_iter / 1.0e9: .2f}GB/s, T: {time_per_iter * 1.0e6:.0f}us"
         )
-        print(json.dumps(dict(
-            method="Device",
-            task="ForwardBackward",
-            alpha=alpha,
-            inter_request_reuse=inter_request_reuse,
-            average_intra_request_shared=average_intra_request_shared,
-            average_inter_request_shared=average_inter_request_shared,
-            B=B,
-            E=E,
-            C=C,
-            D=D,
-            L=L,
-            BW=(3 * L + 2) * (2 if fp16 else 4) * B * T * D / time_per_iter,
-            T=time_per_iter,
-            T_pipe=0,
-        )))
+        print(
+            json.dumps(
+                dict(
+                    method="Device",
+                    task="ForwardBackward",
+                    alpha=alpha,
+                    inter_request_reuse=inter_request_reuse,
+                    average_intra_request_shared=average_intra_request_shared,
+                    average_inter_request_shared=average_inter_request_shared,
+                    B=B,
+                    E=E,
+                    C=C,
+                    D=D,
+                    L=L,
+                    BW=(3 * L + 2)
+                    * (2 if fp16 else 4)
+                    * B
+                    * T
+                    * D
+                    / time_per_iter,
+                    T=time_per_iter,
+                    T_pipe=0,
+                )
+            )
+        )
     # use the pre-specified
     lxu_cache_state = lxu_emb.lxu_cache_state.clone()
     lxu_cache_weights = lxu_emb.lxu_cache_weights.clone()
@@ -493,49 +526,57 @@ def benchmark_e2e(B, E, L, D, C, iters, inter_request_reuse, alpha):
     logging.info(
         f"ForwardBackward (LRU), irr: {inter_request_reuse}, alpha: {alpha}, B: {B}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {(3 * L + 2) * (2 if fp16 else 4) * B * T * D / time_per_iter / 1.0e9: .2f}GB/s, T: {time_per_iter * 1.0e6:.0f}us"
     )
-    print(json.dumps(dict(
-        method="LRU",
-        task="ForwardBackward",
-        alpha=alpha,
-        inter_request_reuse=inter_request_reuse,
-        average_intra_request_shared=average_intra_request_shared,
-        average_inter_request_shared=average_inter_request_shared,
-        B=B,
-        E=E,
-        C=C,
-        D=D,
-        L=L,
-        BW=(3 * L + 2) * (2 if fp16 else 4) * B * T * D / time_per_iter,
-        T=time_per_iter,
-        T_pipe=0,
-    )))
+    print(
+        json.dumps(
+            dict(
+                method="LRU",
+                task="ForwardBackward",
+                alpha=alpha,
+                inter_request_reuse=inter_request_reuse,
+                average_intra_request_shared=average_intra_request_shared,
+                average_inter_request_shared=average_inter_request_shared,
+                B=B,
+                E=E,
+                C=C,
+                D=D,
+                L=L,
+                BW=(3 * L + 2) * (2 if fp16 else 4) * B * T * D / time_per_iter,
+                T=time_per_iter,
+                T_pipe=0,
+            )
+        )
+    )
 
     lxu_emb.lxu_cache_state = lxu_cache_state
     lxu_emb.lxu_cache_weights = lxu_cache_weights
 
     pipeline_time_per_iter, time_per_iter = benchmark_pipelined_requests(
         lambda indices, offsets: lxu_emb.prefetch(indices),
-        lambda indices, offsets: lxu_emb(indices, offsets).backward(grad_out)
+        lambda indices, offsets: lxu_emb(indices, offsets).backward(grad_out),
     )
     logging.info(
         f"ForwardBackward (LRU, Prefetched), irr: {inter_request_reuse}, alpha: {alpha}, B: {B}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {(3 * L + 2) * (2 if fp16 else 4) * B * T * D / time_per_iter / 1.0e9: .2f}GB/s, T: {time_per_iter * 1.0e6:.0f}, Tpipe: {pipeline_time_per_iter * 1.0e6:.0f}us"
     )
-    print(json.dumps(dict(
-        method="LRU (Prefetching)",
-        task="ForwardBackward",
-        alpha=alpha,
-        inter_request_reuse=inter_request_reuse,
-        average_intra_request_shared=average_intra_request_shared,
-        average_inter_request_shared=average_inter_request_shared,
-        B=B,
-        E=E,
-        C=C,
-        D=D,
-        L=L,
-        BW=(3 * L + 2) * (2 if fp16 else 4) * B * T * D / time_per_iter,
-        T=time_per_iter,
-        T_pipe=pipeline_time_per_iter,
-    )))
+    print(
+        json.dumps(
+            dict(
+                method="LRU (Prefetching)",
+                task="ForwardBackward",
+                alpha=alpha,
+                inter_request_reuse=inter_request_reuse,
+                average_intra_request_shared=average_intra_request_shared,
+                average_inter_request_shared=average_inter_request_shared,
+                B=B,
+                E=E,
+                C=C,
+                D=D,
+                L=L,
+                BW=(3 * L + 2) * (2 if fp16 else 4) * B * T * D / time_per_iter,
+                T=time_per_iter,
+                T_pipe=pipeline_time_per_iter,
+            )
+        )
+    )
 
 
 @click.group()
@@ -664,7 +705,6 @@ def e2e(
         f()
 
 
-
 @cli.command()
 @click.option("--num-embeddings", default=int(1e7))
 @click.option("--cache-sets", default=int(1e5))
@@ -682,12 +722,13 @@ def e2e_report(
     batch_size,
     bag_size,
     iters,
-    #inter_request_reuse,
-    #alpha,
+    # inter_request_reuse,
+    # alpha,
     remote,
 ):
     def f():
         import torch
+
         for inter_request_reuse in [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]:
             benchmark_e2e(
                 batch_size,
@@ -734,5 +775,76 @@ def e2e_report(
         logging.info("Finished")
     else:
         f()
+
+
+@cli.command()
+@click.option("--remote", is_flag=True, default=False)
+def unique(remote,):
+    def f():
+        import table_batched_embeddings
+
+        recs = []
+        cmps = []
+        ns = np.logspace(
+            np.log2(2048), np.log2(1024 * 1024), num=100, base=2
+        ).astype(np.int32)
+        for n in ns:
+            xs = (
+                torch.tensor(np.random.zipf(a=1.1, size=(n,))).cuda().int()
+                % 1e7
+            )
+            # xs = torch.tensor(np.random.randint(low=0, high=int(1e7), size=(n,))).cuda().int() % 1e7
+
+            t0 = benchmark_torch_function(100, lambda: torch.unique(xs))
+            recs.append(dict(method="torch.unique", n=n, t=t0, bw=(4 * n) / t0))
+            for lf in [1.25]:  # , 2, 4, 8, 16, 32, 64]:
+                (y, yc) = table_batched_embeddings.lxu_cache_unique_indices(
+                    xs, False, lf
+                )
+                assert yc[0] == torch.unique(xs).numel(), (
+                    yc[0],
+                    torch.unique(xs).numel(),
+                )
+                ys = np.unique(y[: yc[0]].cpu().numpy())
+                zs = np.unique(torch.unique(xs).cpu().numpy())
+                assert set(ys.tolist()) == set(zs.tolist())
+                t = benchmark_torch_function(
+                    100,
+                    lambda: table_batched_embeddings.lxu_cache_unique_indices(
+                        xs, False, lf
+                    ),
+                )
+                recs.append(
+                    dict(method=f"gpu.open_{lf}", n=n, t=t, bw=(4 * n) / t)
+                )
+                cmps.append(dict(lf=lf, n=n, speedup=t0 / t))
+                import scipy.stats
+                print()
+                return recs, cmps
+
+    if remote:
+        import submitit
+
+        executor = submitit.AutoExecutor(folder="sparse_embedding_perf")
+        executor.update_parameters(
+            timeout_min=10,
+            partition="dev",
+            constraint="volta32gb",
+            gpus_per_node=1,
+        )
+        job = executor.submit(f)
+        job.wait()
+        job.result()
+        logging.info("Finished")
+        import time
+
+        time.sleep(1)
+        print(job.stdout())
+        print(job.stderr(), file=sys.stderr)
+        logging.info("Finished")
+    else:
+        f()
+
+
 if __name__ == "__main__":
     cli()

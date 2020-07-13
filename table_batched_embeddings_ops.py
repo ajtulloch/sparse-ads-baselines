@@ -71,7 +71,7 @@ class LookupFunction(torch.autograd.Function):
         if ctx.optimizer == Optimizer.SGD:
             BT_block_size = int(max(256 / weights.shape[1], 1))
             assert per_sample_weights is None
-            if ctx.managed == EmbeddingLocation.DEVICE:
+            if True: #ctx.managed == EmbeddingLocation.DEVICE:
                 grad_per_sample_weight = table_batched_embeddings.backward_sgd(
                     grad_output,
                     weights,

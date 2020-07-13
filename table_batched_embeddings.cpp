@@ -81,7 +81,6 @@ void lxu_cache_backward_sgd_cuda(Tensor grad_output, Tensor weights,
 void lxu_cache_flush_cuda(Tensor weights, Tensor lxu_cache_state,
                           Tensor lxu_cache_weights, int64_t B_block_size);
 
-
 void lxu_cache_backward_sgd_exact_cuda(Tensor grad_output, Tensor weights,
                                        Tensor indices, Tensor offsets,
                                        Tensor lxu_cache_locations,

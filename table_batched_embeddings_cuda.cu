@@ -362,7 +362,8 @@ template <typename scalar_t, bool use_atomics> struct SGDFunctor {
 
   inline void __device__ operator()(scalar_t *weight, Vec4T<scalar_t> grad) {
     // don't handle atomic case.
-    if (use_atomics) {
+    // if (use_atomics) {
+    if (false) {
       gpuAtomicAdd(&weight[0], -grad.acc.x * learning_rate_);
       gpuAtomicAdd(&weight[1], -grad.acc.y * learning_rate_);
       gpuAtomicAdd(&weight[2], -grad.acc.z * learning_rate_);
@@ -852,7 +853,7 @@ struct CUDAManagedAllocator final : public at::Allocator {
     void *ptr;
     AT_CUDA_CHECK(cudaMallocManaged(&ptr, size));
     AT_CUDA_CHECK(cudaMemAdvise(ptr, size, cudaMemAdviseSetPreferredLocation,
-                                cudaCpuDeviceId));
+                                at::cuda::current_device()));
     AT_CUDA_CHECK(cudaMemAdvise(ptr, size, cudaMemAdviseSetAccessedBy,
                                 at::cuda::current_device()));
     return {ptr,
@@ -1976,19 +1977,17 @@ DEVICE_INLINE uint32_t Murmur3(uint32_t k) {
   k ^= k >> 16;
   return k;
 }
-
 constexpr int32_t kCuckooMissing = -1;
 
-__global__ void cuckoo_insert(
-    const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits> indices,
-    PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits> cuckoo_keys) {
+__global__ void
+open_insert(const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits> indices,
+            PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits> cuckoo_keys) {
   unsigned int n = blockIdx.x * blockDim.x + threadIdx.x;
   if (n >= indices.size(0)) {
     return;
   }
   int32_t key = indices[n];
   uint32_t slot = Murmur3(key) % cuckoo_keys.size(0);
-
   while (true) {
     int32_t prev = atomicCAS(&cuckoo_keys[slot], kCuckooMissing, key);
     if (prev == kCuckooMissing || prev == key) {
@@ -2010,19 +2009,33 @@ __global__ void cuckoo_unique_keys(
 
   int32_t key = cuckoo_keys[n];
   if (key != kCuckooMissing) {
+    // CUDA warp aggregation should make this not insanely slow
     unique_indices[atomicAdd(&unique_indices_count[0], 1)] = key;
   }
 }
 
+static inline uint32_t next_pow2(uint32_t x) {
+  x -= 1;
+  x |= (x >> 1);
+  x |= (x >> 2);
+  x |= (x >> 4);
+  x |= (x >> 8);
+  x |= (x >> 16);
+  return x + 1;
+}
+
+constexpr float kLoadFactor = 1.25;
+
 std::pair<Tensor, Tensor> lxu_cache_unique_indices_cuda(Tensor indices) {
   at::cuda::OptionalCUDAGuard device_guard;
   device_guard.set_index(indices.get_device());
-  auto cuckoo_keys =
-      at::empty({indices.size(0) * 4}, indices.options()).fill_(kCuckooMissing);
-  auto unique_indices = at::empty_like(indices);
 
-  cuckoo_insert<<<dim3(div_round_up(indices.numel(), kMaxThreads)), kMaxThreads,
-                  0, at::cuda::getCurrentCUDAStream()>>>(
+  auto cuckoo_keys =
+      at::empty({next_pow2(indices.size(0) * kLoadFactor)}, indices.options())
+          .fill_(kCuckooMissing);
+  auto unique_indices = at::empty_like(indices);
+  open_insert<<<dim3(div_round_up(indices.numel(), kMaxThreads)), kMaxThreads,
+                0, at::cuda::getCurrentCUDAStream()>>>(
       indices.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
       cuckoo_keys.packed_accessor32<int32_t, 1, RestrictPtrTraits>());
 

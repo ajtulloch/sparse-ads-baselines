@@ -583,7 +583,6 @@ def test_lxu_cache_populate(C, D, B, L):
     lxu_cache_state = torch.zeros(4, C, ASSOC).int().cuda()
     lxu_cache_weights = torch.zeros(C * ASSOC, D).float().cuda()
 
-    print(C, D, B, L)
     table_batched_embeddings.lxu_cache_populate(
         bs.weight.view(E, D), indices, lxu_cache_state, lxu_cache_weights, 1, 1
     )
@@ -620,7 +619,6 @@ def test_lxu_cache_lookup(C, D, B, L):
     lxu_cache_state = torch.zeros(4, C, ASSOC).int().cuda()
     lxu_cache_weights = torch.zeros(C * ASSOC, D).float().cuda()
 
-    print(C, D, B, L)
     table_batched_embeddings.lxu_cache_populate(
         bs.weight.view(E, D), indices, lxu_cache_state, lxu_cache_weights, 1, 1
     )
@@ -667,12 +665,7 @@ def test_lxu_cache_forward(C, D, B, L, iters):
         ys = bs(xs)
 
         table_batched_embeddings.lxu_cache_populate(
-            lxu_weights,
-            indices,
-            lxu_cache_state,
-            lxu_cache_weights,
-            t,
-            32,
+            lxu_weights, indices, lxu_cache_state, lxu_cache_weights, t, 32,
         )
         lxu_cache_locations = table_batched_embeddings.lxu_cache_lookup(
             indices, lxu_cache_state, t, 32
@@ -682,10 +675,21 @@ def test_lxu_cache_forward(C, D, B, L, iters):
             f"Cache hit rate on iteration {t}: {np.count_nonzero(lxu_cache_locations.cpu().numpy() != NOT_FOUND) / lxu_cache_locations.numel() * 100:.2f}%, {np.count_nonzero(lxu_cache_locations.cpu().numpy() == NOT_FOUND)} misses"
         )
         if np.count_nonzero(lxu_cache_locations.cpu().numpy() == NOT_FOUND) > 0:
-            for idx in indices[lxu_cache_locations.cpu().numpy() == NOT_FOUND].cpu().numpy():
-                assert(idx not in lxu_cache_state[2, idx % C, :].cpu().numpy().tolist())
-                assert(np.count_nonzero(lxu_cache_state[0, idx % C, :].cpu().numpy()) == ASSOC), (idx, lxu_cache_state[0, idx % C, :])
-
+            for idx in (
+                indices[lxu_cache_locations.cpu().numpy() == NOT_FOUND]
+                .cpu()
+                .numpy()
+            ):
+                assert (
+                    idx
+                    not in lxu_cache_state[2, idx % C, :].cpu().numpy().tolist()
+                )
+                assert (
+                    np.count_nonzero(
+                        lxu_cache_state[0, idx % C, :].cpu().numpy()
+                    )
+                    == ASSOC
+                ), (idx, lxu_cache_state[0, idx % C, :])
 
         lxu_cache_ys = table_batched_embeddings.lxu_cache_forward(
             lxu_weights,
@@ -721,10 +725,20 @@ def test_lxu_cache_forward_backward(C, D, B, L, iters):
     # D = 16
     D = D * 4
     E = int(1e6)
-    bs = table_batched_embeddings_ops.TableBatchedEmbeddingBags(1, E, D, learning_rate=0.05, managed=table_batched_embeddings_ops.EmbeddingLocation.HOST_MAPPED).cuda()
-    bscache = table_batched_embeddings_ops.LXUCacheEmbeddingBag(E, D, C, learning_rate=0.05).cuda()
+    bs = table_batched_embeddings_ops.TableBatchedEmbeddingBags(
+        1,
+        E,
+        D,
+        learning_rate=0.05,
+        managed=table_batched_embeddings_ops.EmbeddingLocation.HOST_MAPPED,
+    ).cuda()
+    bscache = table_batched_embeddings_ops.LXUCacheEmbeddingBag(
+        E, D, C, learning_rate=0.05
+    ).cuda()
 
-    bscache.embedding_weights.detach().view(E, D)[:] = bs.embedding_weights.view(E, D)
+    bscache.embedding_weights.detach().view(E, D)[
+        :
+    ] = bs.embedding_weights.view(E, D)
     for _ in range(iters):
         # Due to different atomicAdd(..) updates, etc, these can differ.
         # xs = torch.tensor(np.random.zipf(1.0001, size=(B, L))).cuda() % E
@@ -732,7 +746,8 @@ def test_lxu_cache_forward_backward(C, D, B, L, iters):
         xs = torch.tensor(
             np.random.choice(range(E), size=(B, L), replace=False).astype(
                 np.int64
-        )).cuda()
+            )
+        ).cuda()
 
         (indices, offsets) = get_table_batched_offsets_from_dense(
             xs.view(1, B, L)
@@ -742,16 +757,26 @@ def test_lxu_cache_forward_backward(C, D, B, L, iters):
         yscache = bscache(indices, offsets)
         # Due to different atomicAdd(..) updates, etc, these can differ.
 
-        torch.testing.assert_allclose(ys.view(B, D), yscache.view(B, D), atol=1e-3, rtol=1e-4)
+        torch.testing.assert_allclose(
+            ys.view(B, D), yscache.view(B, D), atol=1e-3, rtol=1e-4
+        )
         go = torch.randn_like(ys)
         ys.backward(go)
         yscache.backward(go.view(B, D))
 
         lxu_flush_weights = bscache.embedding_weights.detach().clone()
-        table_batched_embeddings.lxu_cache_flush(lxu_flush_weights, bscache.lxu_cache_state, bscache.lxu_cache_weights, 32)
-        torch.testing.assert_allclose(lxu_flush_weights, bs.embedding_weights.view(E, D), atol=1e-3, rtol=1e-4)
-        print(bscache.lxu_cache_state[1, :, :])
-
+        table_batched_embeddings.lxu_cache_flush(
+            lxu_flush_weights,
+            bscache.lxu_cache_state,
+            bscache.lxu_cache_weights,
+            32,
+        )
+        torch.testing.assert_allclose(
+            lxu_flush_weights,
+            bs.embedding_weights.view(E, D),
+            atol=1e-3,
+            rtol=1e-4,
+        )
 
 
 @given(
@@ -762,7 +787,12 @@ def test_lxu_cache_forward_backward(C, D, B, L, iters):
 def test_lxu_cache_unique_indices(B, L):
     E = int(1e6)
     xs = torch.randint(low=0, high=E, size=(B * L,)).cuda().int()
-    (unique_xs, unique_xs_count) = table_batched_embeddings.lxu_cache_unique_indices(xs)
-    uniqued = unique_xs[:unique_xs_count[0]]
-    assert set(np.unique(xs.cpu().numpy()).tolist()) == set(uniqued.cpu().numpy().tolist())
+    (
+        unique_xs,
+        unique_xs_count,
+    ) = table_batched_embeddings.lxu_cache_unique_indices(xs)
+    uniqued = unique_xs[: unique_xs_count[0]]
+    assert set(np.unique(xs.cpu().numpy()).tolist()) == set(
+        uniqued.cpu().numpy().tolist()
+    )
 
