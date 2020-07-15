@@ -10,7 +10,6 @@ import table_batched_embeddings_ops
 
 logging.basicConfig(level=logging.DEBUG)
 
-
 def div_round_up(a, b):
     return int((a + b - 1) // b) * b
 
@@ -26,6 +25,8 @@ def get_table_batched_offsets_from_dense(merged_indices):
 
 
 def benchmark_torch_function(iters, f, *args):
+    for _ in range(iters):
+        f(*args)
     torch.cuda.synchronize()
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
@@ -67,64 +68,11 @@ def benchmark_microbenchmark(B, E, L, D, C, iters, fp16, managed, mixed):
         fp16=fp16,
     ).cuda()
 
-    logging.info(
-        f"Embedding parameters: {cc.embedding_weights.numel() / 1.0e9:.2f}GParam"
-    )
-
-    R = True
-
-    def w1(c):
-        if not R:
-            return c
-
-        @functools.wraps(c)
-        def z(w, x, *args):
-            c(w, x.random_(0, E - 1), *args)
-
-        return z
-
-    def w2(c):
-        if not R:
-            return c
-
-        @functools.wraps(c)
-        def z(w, o, x, *args):
-            c(w, o, x.random_(0, E - 1), *args)
-
-        return z
-
-    def w3(c):
-        if not R:
-            return c
-
-        @functools.wraps(c)
-        def z(g, w, o, x, *args):
-            c(g, w, o, x.random_(0, E - 1), *args)
-
-        return z
-
-    def w4(c):
-        if not R:
-            return c
-
-        @functools.wraps(c)
-        def z(g, w, o, a, x, *args):
-            c(g, w, o, a, x.random_(0, E - 1), *args)
-
-        return z
-
-    def w6(c):
-        if not R:
-            return c
-
-        @functools.wraps(c)
-        def z(g, w, o, a, b, d, x, *args):
-            c(g, w, o, a, b, d, x.random_(0, E - 1), *args)
-
-        return z
-
+    # logging.info(
+    #     f"Embedding parameters: {cc.embedding_weights.numel() / 1.0e9:.2f}GParam"
+    # )
     zs = [
-        # torch.tensor(np.random.zipf(a=1.2, size=(B, L))).int().cuda()
+        # torch.tensor(np.random.zipf(a=1.05, size=(B, L))).int().cuda()
         # % E
         torch.randint(low=0, high=E - 1, size=(T, B, L))
         .int()
@@ -153,6 +101,7 @@ def benchmark_microbenchmark(B, E, L, D, C, iters, fp16, managed, mixed):
     lxu_cache_weights = torch.zeros(C * ASSOC, D).float().cuda()
 
     for N_block_size in [32]:
+        table_batched_embeddings.lxu_cache_unique_indices(indices)
         time_per_iter = benchmark_torch_function(
             iters, table_batched_embeddings.lxu_cache_unique_indices, indices,
         )
@@ -187,7 +136,7 @@ def benchmark_microbenchmark(B, E, L, D, C, iters, fp16, managed, mixed):
         logging.info(
             f"LRU Populate, same values, B: {B} {(N_block_size,)}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {(2 if fp16 else 4) * B * T * L * D / time_per_iter / 1.0e9: .2f}GB/s, T: {time_per_iter * 1.0e6:.0f}us"
         )
-        for N_block_size_ in [1, 4, 8, 16, 32]:
+        for N_block_size_ in [32]:
             time_per_iter = benchmark_torch_function(
                 iters,
                 table_batched_embeddings.lxu_cache_lookup,
@@ -202,6 +151,30 @@ def benchmark_microbenchmark(B, E, L, D, C, iters, fp16, managed, mixed):
         lxu_cache_locations = table_batched_embeddings.lxu_cache_lookup(
             indices, lxu_cache_state, 3, N_block_size
         )
+        is_ = indices.cpu()
+        is_.random_(0, E-1)
+        os_ = offsets.cpu()
+        output_cpu = torch.randn(B, D).pin_memory()
+
+        mask = torch.ones_like(indices, dtype=torch.int8).cpu()
+        import lxu_cache_cpu_funcs
+        import os
+        print("TVM num threads: ", os.environ['TVM_NUM_THREADS'])
+        time_per_iter = benchmark_torch_function(
+            iters,
+            table_batched_embeddings.lxu_cache_forward_cpu,
+            cc.embedding_weights.view(E, D),
+            is_,
+            os_,
+            None,
+            mask,
+            output_cpu,
+            lxu_cache_cpu_funcs.get_forward_cpu_handle(B, E, D),
+        )
+        logging.info(
+            f"Forward (CPU/GPU), , B: {B} {(N_block_size,)}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {(2 if fp16 else 4) * B * T * L * D / time_per_iter / 1.0e9: .2f}GB/s, T: {time_per_iter * 1.0e6:.0f}us"
+        )
+
         time_per_iter = benchmark_torch_function(
             iters,
             table_batched_embeddings.lxu_cache_forward,
@@ -211,89 +184,112 @@ def benchmark_microbenchmark(B, E, L, D, C, iters, fp16, managed, mixed):
             None,
             lxu_cache_locations,
             lxu_cache_weights,
-            N_block_size,
+            32
         )
         logging.info(
             f"Forward (LRU), same values, B: {B} {(N_block_size,)}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {(2 if fp16 else 4) * B * T * L * D / time_per_iter / 1.0e9: .2f}GB/s, T: {time_per_iter * 1.0e6:.0f}us"
         )
+        is_ = indices.cpu()
+        is_.random_(0, E-1)
+        os_ = offsets.cpu()
+        output_cpu = torch.randn(B, D).pin_memory()
+
+        mask = torch.ones_like(indices, dtype=torch.int8).cpu()
+        import lxu_cache_cpu_funcs
+        import os
+        print("TVM num threads: ", os.environ['TVM_NUM_THREADS'])
         time_per_iter = benchmark_torch_function(
             iters,
-            table_batched_embeddings.forward,
-            cc.embedding_weights,
-            cc.table_offsets,
-            indices,
-            offsets,
-            per_sample_weights,
-            L,
-            N_block_size,
-            False,
+            table_batched_embeddings.lxu_cache_forward_cpu,
+            cc.embedding_weights.view(E, D),
+            is_,
+            os_,
+            None,
+            mask,
+            output_cpu,
+            lxu_cache_cpu_funcs.get_forward_cpu_handle(B, E, D),
         )
         logging.info(
-            f"Forward (Managed), B: {B} {(N_block_size, False)}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {(2 if fp16 else 4) * B * T * L * D / time_per_iter / 1.0e9: .2f}GB/s, T: {time_per_iter * 1.0e6:.0f}us"
+            f"Forward (CPU/GPU), , B: {B} {(N_block_size,)}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {(2 if fp16 else 4) * B * T * L * D / time_per_iter / 1.0e9: .2f}GB/s, T: {time_per_iter * 1.0e6:.0f}us"
         )
-        time_per_iter = benchmark_torch_function(
-            iters,
-            table_batched_embeddings.forward,
-            ccd.embedding_weights,
-            ccd.table_offsets,
-            indices,
-            offsets,
-            per_sample_weights,
-            L,
-            N_block_size,
-            False,
-        )
-        logging.info(
-            f"Forward (GPU), B: {B} {(N_block_size, False)}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {(2 if fp16 else 4) * B * T * L * D / time_per_iter / 1.0e9: .2f}GB/s, T: {time_per_iter * 1.0e6:.0f}us"
-        )
-        go = torch.randn(B, D).cuda()
-        time_per_iter = benchmark_torch_function(
-            iters,
-            table_batched_embeddings.lxu_cache_backward_sgd,
-            go,
-            cc.embedding_weights,
-            indices,
-            offsets,
-            lxu_cache_locations,
-            lxu_cache_weights,
-            0.05,
-            32,
-        )
-        logging.info(
-            f"Backward (LRU), same values, B: {B} {(N_block_size,)}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {2 * (2 if fp16 else 4) * B * T * L * D / time_per_iter / 1.0e9: .2f}GB/s, T: {time_per_iter * 1.0e6:.0f}us"
-        )
-        time_per_iter = benchmark_torch_function(
-            iters,
-            table_batched_embeddings.backward_sgd,
-            go.view(B, 1, D),
-            cc.embedding_weights,
-            cc.table_offsets,
-            indices,
-            offsets,
-            0.05,
-            L,
-            N_block_size,
-            False,
-        )
-        logging.info(
-            f"Backward (Managed), same values, B: {B} {(N_block_size,)}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {2 * (2 if fp16 else 4) * B * T * L * D / time_per_iter / 1.0e9: .2f}GB/s, T: {time_per_iter * 1.0e6:.0f}us"
-        )
-        time_per_iter = benchmark_torch_function(
-            iters,
-            table_batched_embeddings.backward_sgd,
-            go.view(B, 1, D),
-            ccd.embedding_weights,
-            ccd.table_offsets,
-            indices,
-            offsets,
-            0.05,
-            L,
-            N_block_size,
-            False,
-        )
-        logging.info(
-            f"Backward (GPU), same values, B: {B} {(N_block_size,)}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {2 * (2 if fp16 else 4) * B * T * L * D / time_per_iter / 1.0e9: .2f}GB/s, T: {time_per_iter * 1.0e6:.0f}us"
-        )
+        # time_per_iter = benchmark_torch_function(
+        #     iters,
+        #     table_batched_embeddings.forward,
+        #     cc.embedding_weights,
+        #     cc.table_offsets,
+        #     indices,
+        #     offsets,
+        #     per_sample_weights,
+        #     L,
+        #     N_block_size,
+        #     False,
+        # )
+        # logging.info(
+        #     f"Forward (Managed), B: {B} {(N_block_size, False)}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {(2 if fp16 else 4) * B * T * L * D / time_per_iter / 1.0e9: .2f}GB/s, T: {time_per_iter * 1.0e6:.0f}us"
+        # )
+        # time_per_iter = benchmark_torch_function(
+        #     iters,
+        #     table_batched_embeddings.forward,
+        #     ccd.embedding_weights,
+        #     ccd.table_offsets,
+        #     indices,
+        #     offsets,
+        #     per_sample_weights,
+        #     L,
+        #     N_block_size,
+        #     False,
+        # )
+        # logging.info(
+        #     f"Forward (GPU), B: {B} {(N_block_size, False)}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {(2 if fp16 else 4) * B * T * L * D / time_per_iter / 1.0e9: .2f}GB/s, T: {time_per_iter * 1.0e6:.0f}us"
+        # )        
+        # go = torch.randn(B, D).cuda()
+        # time_per_iter = benchmark_torch_function(
+        #     iters,
+        #     table_batched_embeddings.lxu_cache_backward_sgd,
+        #     go,
+        #     cc.embedding_weights,
+        #     indices,
+        #     offsets,
+        #     lxu_cache_locations,
+        #     lxu_cache_weights,
+        #     0.05,
+        #     32,
+        # )
+        # logging.info(
+        #     f"Backward (LRU), same values, B: {B} {(N_block_size,)}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {2 * (2 if fp16 else 4) * B * T * L * D / time_per_iter / 1.0e9: .2f}GB/s, T: {time_per_iter * 1.0e6:.0f}us"
+        # )
+        # time_per_iter = benchmark_torch_function(
+        #     iters,
+        #     table_batched_embeddings.backward_sgd,
+        #     go.view(B, 1, D),
+        #     cc.embedding_weights,
+        #     cc.table_offsets,
+        #     indices,
+        #     offsets,
+        #     0.05,
+        #     L,
+        #     N_block_size,
+        #     False,
+        # )
+        # logging.info(
+        #     f"Backward (Managed), same values, B: {B} {(N_block_size,)}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {2 * (2 if fp16 else 4) * B * T * L * D / time_per_iter / 1.0e9: .2f}GB/s, T: {time_per_iter * 1.0e6:.0f}us"
+        # )
+        # time_per_iter = benchmark_torch_function(
+        #     iters,
+        #     table_batched_embeddings.backward_sgd,
+        #     go.view(B, 1, D),
+        #     ccd.embedding_weights,
+        #     ccd.table_offsets,
+        #     indices,
+        #     offsets,
+        #     0.05,
+        #     L,
+        #     N_block_size,
+        #     False,
+        # )
+        # logging.info(
+        #     f"Backward (GPU), same values, B: {B} {(N_block_size,)}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {2 * (2 if fp16 else 4) * B * T * L * D / time_per_iter / 1.0e9: .2f}GB/s, T: {time_per_iter * 1.0e6:.0f}us"
+        # )
 
 
 def generate_requests(iters, B, L, E, inter_request_reuse, alpha):
@@ -459,7 +455,7 @@ def benchmark_e2e(B, E, L, D, C, iters, inter_request_reuse, alpha):
         )
     )
     logging.info(
-        f"ForwardBackward (Managed), irr: {inter_request_reuse}, alpha: {alpha}, B: {B}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {(3 * L + 2)  * (2 if fp16 else 4) * B * T * D / time_per_iter / 1.0e9: .2f}GB/s, T: {time_per_iter * 1.0e6:.0f}us"
+        f"ForwardBackward (Host-Mapped), irr: {inter_request_reuse}, alpha: {alpha}, B: {B}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {(3 * L + 2)  * (2 if fp16 else 4) * B * T * D / time_per_iter / 1.0e9: .2f}GB/s, T: {time_per_iter * 1.0e6:.0f}us"
     )
     print(
         json.dumps(
@@ -777,73 +773,6 @@ def e2e_report(
         f()
 
 
-@cli.command()
-@click.option("--remote", is_flag=True, default=False)
-def unique(remote,):
-    def f():
-        import table_batched_embeddings
-
-        recs = []
-        cmps = []
-        ns = np.logspace(
-            np.log2(2048), np.log2(1024 * 1024), num=100, base=2
-        ).astype(np.int32)
-        for n in ns:
-            xs = (
-                torch.tensor(np.random.zipf(a=1.1, size=(n,))).cuda().int()
-                % 1e7
-            )
-            # xs = torch.tensor(np.random.randint(low=0, high=int(1e7), size=(n,))).cuda().int() % 1e7
-
-            t0 = benchmark_torch_function(100, lambda: torch.unique(xs))
-            recs.append(dict(method="torch.unique", n=n, t=t0, bw=(4 * n) / t0))
-            for lf in [1.25]:  # , 2, 4, 8, 16, 32, 64]:
-                (y, yc) = table_batched_embeddings.lxu_cache_unique_indices(
-                    xs, False, lf
-                )
-                assert yc[0] == torch.unique(xs).numel(), (
-                    yc[0],
-                    torch.unique(xs).numel(),
-                )
-                ys = np.unique(y[: yc[0]].cpu().numpy())
-                zs = np.unique(torch.unique(xs).cpu().numpy())
-                assert set(ys.tolist()) == set(zs.tolist())
-                t = benchmark_torch_function(
-                    100,
-                    lambda: table_batched_embeddings.lxu_cache_unique_indices(
-                        xs, False, lf
-                    ),
-                )
-                recs.append(
-                    dict(method=f"gpu.open_{lf}", n=n, t=t, bw=(4 * n) / t)
-                )
-                cmps.append(dict(lf=lf, n=n, speedup=t0 / t))
-                import scipy.stats
-                print()
-                return recs, cmps
-
-    if remote:
-        import submitit
-
-        executor = submitit.AutoExecutor(folder="sparse_embedding_perf")
-        executor.update_parameters(
-            timeout_min=10,
-            partition="dev",
-            constraint="volta32gb",
-            gpus_per_node=1,
-        )
-        job = executor.submit(f)
-        job.wait()
-        job.result()
-        logging.info("Finished")
-        import time
-
-        time.sleep(1)
-        print(job.stdout())
-        print(job.stderr(), file=sys.stderr)
-        logging.info("Finished")
-    else:
-        f()
 
 
 if __name__ == "__main__":

@@ -796,3 +796,121 @@ def test_lxu_cache_unique_indices(B, L):
         uniqued.cpu().numpy().tolist()
     )
 
+
+@given(
+    st.integers(min_value=1, max_value=32),
+    st.integers(min_value=1, max_value=2048),
+    st.integers(min_value=1, max_value=20),
+)
+@settings(verbosity=Verbosity.verbose, deadline=None, max_examples=100)
+def test_lxu_cache_forward_cpu(D, B, L):
+    D = D * 4
+    E = int(1e6)
+    bs = table_batched_embeddings_ops.TableBatchedEmbeddingBags(
+        1,
+        E,
+        D,
+        learning_rate=0.05,
+        managed=table_batched_embeddings_ops.EmbeddingLocation.HOST_MAPPED,
+    ).cuda()
+
+    # iters = 20
+    xs = torch.tensor(np.random.zipf(1.15, size=(B, L))) % E
+    # xs = torch.randint(low=0, high=E, size=(B, L)).cuda()
+    (indices, offsets) = get_table_batched_offsets_from_dense(xs.view(1, B, L))
+    ys = bs(indices, offsets)
+    mask = torch.ones_like(indices, dtype=torch.int8).cpu()
+    output = torch.randn(B, D).pin_memory()
+    import lxu_cache_cpu_funcs
+    lxu_cache_ys = table_batched_embeddings.lxu_cache_forward_cpu(
+        bs.embedding_weights.view(E, D),
+        indices.cpu(),
+        offsets.cpu(),
+        None,
+        mask,
+        output,
+        lxu_cache_cpu_funcs.get_forward_cpu_handle(B, E, D),
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_allclose(ys.view(B, D).cpu(), lxu_cache_ys)
+
+
+@given(
+    st.integers(min_value=1, max_value=32),
+    st.integers(min_value=1, max_value=2048),
+    st.integers(min_value=1, max_value=20),
+    st.integers(min_value=1, max_value=10),
+)
+@settings(verbosity=Verbosity.verbose, deadline=None, max_examples=100)
+def test_lxu_cache_forward_backward_cpu(D, B, L, iters):
+    # C = int(1e6)
+    # B = 16384
+    # L = 10
+    # D = 16
+    C = 128
+    D = D * 4
+    E = int(1e6)
+    bs = table_batched_embeddings_ops.TableBatchedEmbeddingBags(
+        1,
+        E,
+        D,
+        learning_rate=0.05,
+        managed=table_batched_embeddings_ops.EmbeddingLocation.HOST_MAPPED,
+    ).cuda()
+
+    bscache = table_batched_embeddings_ops.LXUCacheEmbeddingBag(
+        E, D, C, learning_rate=0.05
+    ).cuda()
+
+    bscache.embedding_weights.detach().view(E, D)[
+        :
+    ] = bs.embedding_weights.view(E, D)
+    for _ in range(iters):
+        # Due to different atomicAdd(..) updates, etc, these can differ.
+        # xs = torch.tensor(np.random.zipf(1.0001, size=(B, L))).cuda() % E
+
+        xs = torch.tensor(
+            np.random.choice(range(E), size=(B, L), replace=False).astype(
+                np.int64
+            )
+        ).cuda()
+
+        (indices, offsets) = get_table_batched_offsets_from_dense(
+            xs.view(1, B, L)
+        )
+        ys = bs(indices, offsets)
+        # Due to different atomicAdd(..) updates, etc, these can differ.
+        import lxu_cache_cpu_funcs
+        output = torch.randn(B, D).pin_memory()
+        mask = torch.ones_like(indices, dtype=torch.int8).cpu()
+        yscache = table_batched_embeddings.lxu_cache_forward_cpu(
+            bscache.embedding_weights.view(E, D),
+            indices.cpu(),
+            offsets.cpu(),
+            None,
+            mask,
+            output,
+            lxu_cache_cpu_funcs.get_forward_cpu_handle(B, E, D),
+        )
+        torch.cuda.synchronize()
+        torch.testing.assert_allclose(
+            ys.cpu().view(B, D), yscache.view(B, D), atol=1e-3, rtol=1e-4
+        )
+        go = torch.randn_like(ys)
+        ys.backward(go)
+        table_batched_embeddings.lxu_cache_backward_sgd_cpu(
+            go.cpu().view(B, D),
+            bscache.embedding_weights.view(E, D),
+            indices.cpu(),
+            offsets.cpu(),
+            mask,
+            0.05,
+            lxu_cache_cpu_funcs.get_backward_cpu_handle(B, E, D),
+        )
+        torch.cuda.synchronize()
+        torch.testing.assert_allclose(
+            bscache.embedding_weights.view(E, D),
+            bs.embedding_weights.view(E, D),
+            atol=1e-3,
+            rtol=1e-4,
+        )

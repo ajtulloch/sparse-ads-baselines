@@ -591,7 +591,7 @@ class LXUCacheEmbeddingBag(nn.Module):
         import table_batched_embeddings
 
         super(LXUCacheEmbeddingBag, self).__init__()
-        logging.info("Allocating host-mapped embedding bag")
+        logging.info("Allocating host-mapped lru-backed embedding bag")
         embedding_data = torch.randn(
             size=(num_embeddings, embedding_dim),
             out=table_batched_embeddings.new_host_mapped_tensor(

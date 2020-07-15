@@ -8,14 +8,13 @@
 #include "cub/device/device_radix_sort.cuh"
 #include "cub/device/device_select.cuh"
 
-#include <thrust/binary_search.h>
-#include <thrust/execution_policy.h>
-#include <thrust/iterator/counting_iterator.h>
-
+#include <chrono>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
 #include <mutex>
+#define DMLC_GLOG_DEFINED 1
+#include <tvm/runtime/packed_func.h>
 
 using namespace at;
 
@@ -853,7 +852,7 @@ struct CUDAManagedAllocator final : public at::Allocator {
     void *ptr;
     AT_CUDA_CHECK(cudaMallocManaged(&ptr, size));
     AT_CUDA_CHECK(cudaMemAdvise(ptr, size, cudaMemAdviseSetPreferredLocation,
-                                at::cuda::current_device()));
+                                cudaCpuDeviceId));
     AT_CUDA_CHECK(cudaMemAdvise(ptr, size, cudaMemAdviseSetAccessedBy,
                                 at::cuda::current_device()));
     return {ptr,
@@ -874,8 +873,9 @@ static void CUDAHostMappedDeleter(void *ptr) {
 struct CUDAHostMappedAllocator final : public at::Allocator {
   at::DataPtr allocate(size_t size) const override {
     void *ptr;
-    AT_CUDA_CHECK(cudaHostAlloc(&ptr, size, cudaHostAllocWriteCombined |
-                                                cudaHostAllocMapped));
+    AT_CUDA_CHECK(cudaHostAlloc(&ptr, size, cudaHostAllocMapped));
+    // AT_CUDA_CHECK(cudaHostAlloc(&ptr, size, cudaHostAllocWriteCombined |
+    //                                               cudaHostAllocMapped));
 
     void *dev_ptr;
     AT_CUDA_CHECK(cudaHostGetDevicePointer(&dev_ptr, ptr, 0));
@@ -2054,7 +2054,7 @@ std::pair<Tensor, Tensor> lxu_cache_unique_indices_cuda(Tensor indices) {
 constexpr int32_t kCacheSlotTime = 0;
 constexpr int32_t kCacheSlotFreq = 1;
 constexpr int32_t kCacheSlotCurrentIndex = 2;
-constexpr int32_t kCacheSlotBloomFilter = 3;
+// constexpr int32_t kCacheSlotBloomFilter = 3;
 
 // TODO: decouple these?
 constexpr int32_t kAssoc = kWarpSize;
@@ -2413,55 +2413,10 @@ void lxu_cache_populate_cuda(Tensor weights, Tensor indices,
   at::cuda::OptionalCUDAGuard device_guard;
   device_guard.set_index(indices.get_device());
   const int32_t N = indices.numel();
-  // auto sorted_indices = empty_like(indices);
-  // // Step 1: sort indices
-  // {
-  //   size_t temp_storage_bytes = 0;
-  //   AT_CUDA_CHECK(cub::DeviceRadixSort::SortKeys(
-  //       nullptr, temp_storage_bytes, (uint32_t *)indices.data_ptr(),
-  //       (uint32_t *)sorted_indices.data_ptr(), N, 0,
-  //       int(log2(weights.size(0)) + 1), at::cuda::getCurrentCUDAStream(),
-  //       false));
-
-  //   auto temp_storage = at::empty({static_cast<int64_t>(temp_storage_bytes)},
-  //                                 indices.options().dtype(kByte));
-  //   AT_CUDA_CHECK(cub::DeviceRadixSort::SortKeys(
-  //       temp_storage.data_ptr(), temp_storage_bytes,
-  //       (uint32_t *)indices.data_ptr(), (uint32_t
-  //       *)sorted_indices.data_ptr(),
-  //       N, 0, int(log2(weights.size(0)) + 1),
-  //       at::cuda::getCurrentCUDAStream(),
-  //       false));
-  // }
-  // std::cout << sorted_indices << std::endl;
-  // Step 2: find unique indices
-  // auto unique_indices = empty_like(indices);
-  // auto unique_indices_count = empty({1}, indices.options().dtype(kInt));
-
   auto unique_indices_and_count = lxu_cache_unique_indices_cuda(indices);
   auto unique_indices = unique_indices_and_count.first;
   auto unique_indices_count = unique_indices_and_count.second;
-
-  // {
-  //   size_t temp_storage_bytes = 0;
-  //   AT_CUDA_CHECK(cub::DeviceSelect::Unique(
-  //       nullptr, temp_storage_bytes, (int32_t *)sorted_indices.data_ptr(),
-  //       (int32_t *)unique_indices.data_ptr(),
-  //       (int32_t *)unique_indices_count.data_ptr(), N,
-  //       at::cuda::getCurrentCUDAStream(), false));
-
-  //   auto temp_storage = at::empty({static_cast<int64_t>(temp_storage_bytes)},
-  //                                 indices.options().dtype(kByte));
-  //   AT_CUDA_CHECK(
-  //       cub::DeviceSelect::Unique(temp_storage.data_ptr(),
-  //       temp_storage_bytes,
-  //                                 (int32_t *)sorted_indices.data_ptr(),
-  //                                 (int32_t *)unique_indices.data_ptr(),
-  //                                 (int32_t *)unique_indices_count.data_ptr(),
-  //                                 N,
-  //                                 at::cuda::getCurrentCUDAStream(), false));
-  // }
-  // Step 3: find uncached indices
+  // Step: find uncached indices
   auto cache_sets = empty_like(indices);
   {
     batched_embedding_forward_kernel_lxu_cache_find_uncached<<<
@@ -2473,10 +2428,9 @@ void lxu_cache_populate_cuda(Tensor weights, Tensor indices,
         cache_sets.packed_accessor32<int32_t, 1, RestrictPtrTraits>());
     AT_CUDA_CHECK(cudaGetLastError());
   }
-  // Step 4: sort the cache sets and ids
+  // Step: sort the cache sets and ids
   auto sorted_cache_sets = empty_like(cache_sets);
   auto cache_set_sorted_unique_indices = empty_like(unique_indices);
-
   {
     size_t temp_storage_bytes = 0;
     AT_CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
@@ -2498,8 +2452,6 @@ void lxu_cache_populate_cuda(Tensor weights, Tensor indices,
         int(log2(lxu_cache_state.size(1) + 1) + 1),
         at::cuda::getCurrentCUDAStream(), false));
   }
-  // std::cout << sorted_cache_sets << std::endl;
-
   AT_DISPATCH_FLOATING_TYPES_AND_HALF(
       weights.type(),
       "batched_embedding_forward_kernel_lxu_cache_insert_uncached", ([&] {
@@ -2538,7 +2490,12 @@ Tensor lxu_cache_lookup_cuda(Tensor indices, Tensor lxu_cache_state, int64_t t,
   return lxu_cache_locations;
 }
 
-template <typename scalar_t, typename F>
+enum class LXUCacheMaskAction {
+  USE_BACKING_STORE,
+  SKIP,
+};
+
+template <typename scalar_t, LXUCacheMaskAction Action, typename F>
 __global__ void lxu_cache_forward_kernel_1(
     // [\sum_t E_t][D]
     const PackedTensorAccessor64<scalar_t, 2, RestrictPtrTraits> weights,
@@ -2576,19 +2533,179 @@ __global__ void lxu_cache_forward_kernel_1(
         Vec4T<scalar_t> weight((&lxu_cache_weights[cache_idx][0]) + d * 4);
         f.accumulate(sum, weight, indices_start + l);
       } else {
-        auto idx = __ldg(&indices[indices_start + l]);
-        Vec4T<scalar_t> weight((&weights[idx][0]) + d * 4);
-        f.accumulate(sum, weight, indices_start + l);
+        if (Action == LXUCacheMaskAction::USE_BACKING_STORE) {
+          auto idx = __ldg(&indices[indices_start + l]);
+          Vec4T<scalar_t> weight((&weights[idx][0]) + d * 4);
+          f.accumulate(sum, weight, indices_start + l);
+        }
       }
     }
     sum.store((&output[b][0]) + d * 4);
   }
 }
 
-Tensor lxu_cache_forward_cuda(Tensor weights, Tensor indices, Tensor offsets,
-                              c10::optional<Tensor> indice_weights,
-                              Tensor lxu_cache_locations,
-                              Tensor lxu_cache_weights, int64_t B_block_size) {
+DLDataType getDLDataType(const Tensor &t) {
+  DLDataType dtype;
+  dtype.lanes = 1;
+  dtype.bits = t.element_size() * 8;
+  switch (t.scalar_type()) {
+  case ScalarType::Byte:
+    dtype.code = DLDataTypeCode::kDLUInt;
+    break;
+  case ScalarType::Char:
+    dtype.code = DLDataTypeCode::kDLInt;
+    break;
+  case ScalarType::Double:
+    dtype.code = DLDataTypeCode::kDLFloat;
+    break;
+  case ScalarType::Float:
+    dtype.code = DLDataTypeCode::kDLFloat;
+    break;
+  case ScalarType::Int:
+    dtype.code = DLDataTypeCode::kDLInt;
+    break;
+  case ScalarType::Long:
+    dtype.code = DLDataTypeCode::kDLInt;
+    break;
+  case ScalarType::Short:
+    dtype.code = DLDataTypeCode::kDLInt;
+    break;
+  case ScalarType::Half:
+    dtype.code = DLDataTypeCode::kDLFloat;
+    break;
+  case ScalarType::Bool:
+    dtype.code = DLDataTypeCode::kDLUInt;
+    break;
+  }
+  return dtype;
+}
+
+DLTensor toDLTensor(Tensor src, bool host_mapped = false) {
+  DLTensor rv;
+  rv.data =
+      host_mapped ? src.storage().data_ptr().get_context() : src.data_ptr();
+  rv.ctx.device_type = DLDeviceType::kDLCPU;
+  rv.ctx.device_id = 0;
+  rv.ndim = src.dim();
+  rv.dtype = getDLDataType(src);
+  rv.shape = const_cast<int64_t *>(src.sizes().data());
+  rv.strides = const_cast<int64_t *>(src.strides().data());
+  rv.byte_offset = 0;
+  return rv;
+}
+
+Tensor lxu_cache_forward_cpu(Tensor weights, Tensor indices_cpu,
+                             Tensor offsets_cpu,
+                             c10::optional<Tensor> indice_weights_cpu,
+                             Tensor mask_cpu, Tensor output_cpu,
+                             int64_t handle) {
+  at::cuda::OptionalCUDAGuard device_guard;
+  device_guard.set_index(weights.get_device());
+  const auto D = weights.size(1);
+  const auto B = (offsets_cpu.size(0) - 1);
+  // auto output_cpu = empty({B, D}, indices_cpu.options()
+  //                                     .device(kCPU)
+  //                                     .dtype(weights.options().dtype())
+  //                                     .pinned_memory(true));
+  std::function<void()> *functor = new std::function<void()>(
+      [weights, indices_cpu, offsets_cpu, mask_cpu, output_cpu, handle]() {
+        auto pf = *static_cast<tvm::runtime::PackedFunc *>(
+            reinterpret_cast<TVMFunctionHandle>(handle));
+        auto weights_dl = toDLTensor(weights, true);
+        auto indices_dl = toDLTensor(indices_cpu, false);
+        auto offsets_dl = toDLTensor(offsets_cpu, false);
+        auto mask_dl = toDLTensor(mask_cpu, false);
+        auto output_dl = toDLTensor(output_cpu, false);
+        // std::chrono::steady_clock::time_point begin =
+        // std::chrono::steady_clock::now();
+        pf(&weights_dl, &indices_dl, &offsets_dl, &mask_dl, &output_dl);
+        // std::chrono::steady_clock::time_point end =
+        // std::chrono::steady_clock::now();
+        // std::cout << "Inside cudaStreamAddCallback t = " <<
+        // std::chrono::duration_cast<std::chrono::microseconds>(end -
+        // begin).count() << "us" << std::endl;
+      });
+  // auto callFunctor = [](void *userData) -> void {
+  //   auto *f = reinterpret_cast<std::function<void()> *>(userData);
+  //   (*f)();
+  //   delete f; // TODO: will this invoke destructors that call any CUDA API
+  //             // functions?
+  // };
+  auto callFunctor = [](cudaStream_t stream, cudaError_t status,
+                        void *userData) -> void {
+    auto *f = reinterpret_cast<std::function<void()> *>(userData);
+    (*f)();
+    delete f; // TODO: will this invoke destructors that call any CUDA API
+    // functions?
+  };
+
+  // auto pf = *static_cast<tvm::runtime::PackedFunc *>(
+  //     reinterpret_cast<TVMFunctionHandle>(handle));
+  // auto weights_dl = toDLTensor(weights, true);
+  // auto indices_dl = toDLTensor(indices_cpu, false);
+  // auto offsets_dl = toDLTensor(offsets_cpu, false);
+  // auto mask_dl = toDLTensor(mask_cpu, false);
+  // auto output_dl = toDLTensor(output_cpu, false);
+  // std::chrono::steady_clock::time_point begin =
+  // std::chrono::steady_clock::now();
+  // pf(&weights_dl, &indices_dl, &offsets_dl, &mask_dl, &output_dl);
+  // std::chrono::steady_clock::time_point end =
+  // std::chrono::steady_clock::now();
+  // std::cout << "Outside cudaStreamAddCallback t = " <<
+  // std::chrono::duration_cast<std::chrono::microseconds>(end - begin).count()
+  // << "[us]" << std::endl;
+
+  // std::chrono::steady_clock::time_point begin =
+  // std::chrono::steady_clock::now();
+  // (*functor)();
+  // std::chrono::steady_clock::time_point end =
+  // std::chrono::steady_clock::now();
+  // std::cout << "Outside cudaStreamAddCallback(..) = " <<
+  // std::chrono::duration_cast<std::chrono::microseconds>(end - begin).count()
+  // << "[us]" << std::endl;
+  AT_CUDA_CHECK(cudaStreamAddCallback(at::cuda::getCurrentCUDAStream(),
+                                      callFunctor, functor, 0));
+  return output_cpu;
+}
+
+void lxu_cache_backward_sgd_cpu(Tensor grad_output_cpu, Tensor weights,
+                                Tensor indices_cpu, Tensor offsets_cpu,
+                                Tensor mask_cpu, float learning_rate,
+                                int64_t handle) {
+  at::cuda::OptionalCUDAGuard device_guard;
+  device_guard.set_index(weights.get_device());
+  const auto D = weights.size(1);
+  const auto B = (offsets_cpu.size(0) - 1);
+  std::function<void()> *functor = new std::function<void()>(
+      [grad_output_cpu, weights, indices_cpu, offsets_cpu, mask_cpu,
+       learning_rate, handle]() {
+        auto pf = *static_cast<tvm::runtime::PackedFunc *>(
+            reinterpret_cast<TVMFunctionHandle>(handle));
+        auto grad_output_dl = toDLTensor(grad_output_cpu, false);
+        auto weights_dl = toDLTensor(weights, true);
+        auto indices_dl = toDLTensor(indices_cpu, false);
+        auto offsets_dl = toDLTensor(offsets_cpu, false);
+        auto mask_dl = toDLTensor(mask_cpu, false);
+        pf(&grad_output_dl, &weights_dl, &indices_dl, &offsets_dl, &mask_dl,
+           learning_rate);
+      });
+  auto callFunctor = [](void *userData) -> void {
+    auto *f = reinterpret_cast<std::function<void()> *>(userData);
+    (*f)();
+    delete f; // TODO: will this invoke destructors that call any CUDA API
+    // functions?
+  };
+  AT_CUDA_CHECK(cudaLaunchHostFunc(at::cuda::getCurrentCUDAStream(),
+                                   callFunctor, functor));
+  return;
+}
+
+template <LXUCacheMaskAction Action>
+Tensor
+lxu_cache_forward_cuda_impl(Tensor weights, Tensor indices, Tensor offsets,
+                            c10::optional<Tensor> indice_weights,
+                            Tensor lxu_cache_locations,
+                            Tensor lxu_cache_weights, int64_t B_block_size) {
   at::cuda::OptionalCUDAGuard device_guard;
   device_guard.set_index(lxu_cache_weights.get_device());
   const auto D = weights.size(1);
@@ -2602,7 +2719,8 @@ Tensor lxu_cache_forward_cuda(Tensor weights, Tensor indices, Tensor offsets,
 
 #define X(functor)                                                             \
   lxu_cache_forward_kernel_1<                                                  \
-      scalar_t><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(     \
+      scalar_t,                                                                \
+      Action><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(       \
       weights.packed_accessor64<scalar_t, 2, RestrictPtrTraits>(),             \
       indices.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),              \
       offsets.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),              \
@@ -2627,6 +2745,26 @@ Tensor lxu_cache_forward_cuda(Tensor weights, Tensor indices, Tensor offsets,
 #undef X
   AT_CUDA_CHECK(cudaGetLastError());
   return output;
+}
+
+Tensor lxu_cache_forward_cuda(Tensor weights, Tensor indices, Tensor offsets,
+                              c10::optional<Tensor> indice_weights,
+                              Tensor lxu_cache_locations,
+                              Tensor lxu_cache_weights, int64_t B_block_size) {
+  return lxu_cache_forward_cuda_impl<LXUCacheMaskAction::USE_BACKING_STORE>(
+      weights, indices, offsets, indice_weights, lxu_cache_locations,
+      lxu_cache_weights, B_block_size);
+}
+
+Tensor lxu_cache_forward_mixed_cuda(Tensor weights, Tensor indices,
+                                    Tensor offsets,
+                                    c10::optional<Tensor> indice_weights,
+                                    Tensor lxu_cache_locations,
+                                    Tensor lxu_cache_weights,
+                                    int64_t B_block_size) {
+  return lxu_cache_forward_cuda_impl<LXUCacheMaskAction::SKIP>(
+      weights, indices, offsets, indice_weights, lxu_cache_locations,
+      lxu_cache_weights, B_block_size);
 }
 
 template <typename scalar_t>
@@ -2765,12 +2903,13 @@ __global__ void lxu_cache_backward_sgd_exact_kernel_1(
     PackedTensorAccessor64<scalar_t, 2, RestrictPtrTraits> lxu_cache_weights,
     F f) {
   const int32_t B = grad_output.size(0);
-  const int32_t T = 1; // grad_output.size(1);
+  // const int32_t T = 1; // grad_output.size(1);
   const int32_t D = grad_output.size(1);
   const int32_t indices_numel = indices.size(0);
   int32_t sorted_linear_indice_id = blockIdx.x * blockDim.y + threadIdx.y;
   if (sorted_linear_indice_id >= indices_numel) {
-    // don't have *warp* divergence since we launch full warps in blockDim.x, so
+    // don't have *warp* divergence since we launch full warps in blockDim.x,
+    // so
     // we can just exit this warp entirely.
     return;
   }
@@ -2781,7 +2920,8 @@ __global__ void lxu_cache_backward_sgd_exact_kernel_1(
                             sorted_linear_indices[sorted_linear_indice_id]);
 
   if (!segment_start) {
-    // don't have *warp* divergence since we launch full warps in blockDim.x, so
+    // don't have *warp* divergence since we launch full warps in blockDim.x,
+    // so
     // we can just exit this warp entirely.
     return;
   }
@@ -2796,7 +2936,7 @@ __global__ void lxu_cache_backward_sgd_exact_kernel_1(
   // now, each segment corresponds to exactly one table `t` and row in that
   // table (`idx`). Thus, we can hoist out some of the book-keeping.
   auto info_0 = infos[sorted_linear_indice_id];
-  const int32_t t = info_0.b_t / B;
+  // const int32_t t = info_0.b_t / B;
   const int64_t table_offset = 0; // table_offsets[t];
   const int32_t idx = linear_index - table_offset;
   const int32_t cache_idx = lxu_cache_locations[info_0.indices_idx];

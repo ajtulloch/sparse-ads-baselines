@@ -90,6 +90,25 @@ void lxu_cache_backward_sgd_exact_cuda(Tensor grad_output, Tensor weights,
 
 std::pair<Tensor, Tensor> lxu_cache_unique_indices_cuda(Tensor indices);
 
+Tensor lxu_cache_forward_cpu(Tensor weights, Tensor indices_cpu,
+                             Tensor offsets_cpu,
+                             c10::optional<Tensor> indice_weights_cpu,
+                             Tensor mask_cpu, Tensor output_cpu, int64_t handle);
+
+
+void lxu_cache_backward_sgd_cpu(Tensor grad_output_cpu, Tensor weights,
+                                Tensor indices_cpu, Tensor offsets_cpu,
+                                Tensor mask_cpu, float learning_rate,
+                                int64_t handle);
+
+
+Tensor lxu_cache_forward_mixed_cuda(Tensor weights, Tensor indices,
+                                    Tensor offsets,
+                                    c10::optional<Tensor> indice_weights,
+                                    Tensor lxu_cache_locations,
+                                    Tensor lxu_cache_weights,
+                                    int64_t B_block_size);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     m.def("forward", &batched_embedding_forward_cuda);
@@ -114,4 +133,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("lxu_cache_backward_sgd_exact", &lxu_cache_backward_sgd_exact_cuda);
     m.def("lxu_cache_flush", &lxu_cache_flush_cuda);
     m.def("lxu_cache_unique_indices", &lxu_cache_unique_indices_cuda);
+    m.def("lxu_cache_forward_cpu", &lxu_cache_forward_cpu);
+    m.def("lxu_cache_backward_sgd_cpu", &lxu_cache_backward_sgd_cpu);
+
+    m.def("lxu_cache_forward_mixed_cuda", &lxu_cache_forward_mixed_cuda);
 }
