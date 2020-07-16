@@ -6,6 +6,7 @@ import numpy as np
 import table_batched_embeddings_ops
 import table_batched_embeddings
 
+NOT_FOUND = np.iinfo(np.int32).max
 
 def div_round_up(a, b):
     return int((a + b - 1) // b) * b
@@ -670,7 +671,6 @@ def test_lxu_cache_forward(C, D, B, L, iters):
         lxu_cache_locations = table_batched_embeddings.lxu_cache_lookup(
             indices, lxu_cache_state, t, 32
         )
-        NOT_FOUND = np.iinfo(np.int32).max
         print(
             f"Cache hit rate on iteration {t}: {np.count_nonzero(lxu_cache_locations.cpu().numpy() != NOT_FOUND) / lxu_cache_locations.numel() * 100:.2f}%, {np.count_nonzero(lxu_cache_locations.cpu().numpy() == NOT_FOUND)} misses"
         )
@@ -914,3 +914,54 @@ def test_lxu_cache_forward_backward_cpu(D, B, L, iters):
             atol=1e-3,
             rtol=1e-4,
         )
+
+
+@given(
+    st.integers(min_value=1, max_value=32),
+    st.integers(min_value=1, max_value=2048),
+    st.integers(min_value=1, max_value=20),
+    st.floats(min_value=0.0, max_value=1.0),
+)
+@settings(verbosity=Verbosity.verbose, deadline=None, max_examples=100)
+def test_lxu_cache_forward_mixed(D, B, L, p):
+    D = D * 4
+    E = int(1e6)
+    C = 1000
+    bscache = table_batched_embeddings_ops.LXUCacheEmbeddingBag(
+        E, D, C, learning_rate=0.05
+    ).cuda()
+
+    # iters = 20
+    xs = torch.tensor(np.random.zipf(1.15, size=(B, L))) % E
+    # xs = torch.randint(low=0, high=E, size=(B, L)).cuda()
+    (indices, offsets) = get_table_batched_offsets_from_dense(xs.view(1, B, L))
+    ys = bscache(indices, offsets)
+
+    # mask = torch.zeros_like(indices, dtype=torch.int8).cpu()
+    # todo: 
+    mask = (torch.rand(indices.shape) > p).to(torch.int8).cpu()
+    # mask is 1 when the CPU computes output. Therefore, when mask is 1, we set lxu_cache_locations to LXU_NOT_FOUND
+    output_cpu = torch.randn(B, D).pin_memory()
+    lxu_cache_locations = table_batched_embeddings.lxu_cache_lookup(
+        indices, bscache.lxu_cache_state, 5, 32
+    )
+    lxu_cache_locations = torch.where(mask.cuda() != 0, torch.empty_like(lxu_cache_locations).fill_(NOT_FOUND), lxu_cache_locations)
+    import lxu_cache_cpu_funcs
+    lxu_cache_ys = lxu_cache_cpu_funcs.lxu_cache_forward_mixed_cpu_cuda(
+        weights=bscache.embedding_weights.view(E, D),
+        indices=indices,
+        offsets=offsets,
+        lxu_cache_locations=lxu_cache_locations,
+        lxu_cache_weights=bscache.lxu_cache_weights,
+        B_block_size=32,
+        indices_cpu=indices.cpu(),
+        offsets_cpu=offsets.cpu(),
+        mask_cpu=mask,
+        output_cpu=output_cpu,
+        handle=lxu_cache_cpu_funcs.get_forward_cpu_handle(B, E, D),
+        cpu_stream=torch.cuda.Stream(),
+        cpu_event_start=torch.cuda.Event(),
+        cpu_event_finish=torch.cuda.Event()
+    )
+    torch.testing.assert_allclose(ys, lxu_cache_ys)
+

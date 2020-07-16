@@ -157,3 +157,88 @@ def get_backward_cpu_handle(B, E, D):
         f = tvm.build(s, [GO, W, I, O, MASK, learning_rate])
     BCACHE[key] = f.get_function(f.entry_name)
     return get_backward_cpu_handle(B, E, D)
+
+
+def lxu_cache_forward_mixed_cpu_cuda(
+    weights,
+    indices,
+    offsets,
+    lxu_cache_locations,
+    lxu_cache_weights,
+    B_block_size,
+    indices_cpu,
+    offsets_cpu,
+    mask_cpu,
+    output_cpu,
+    handle,
+    cpu_stream,
+    cpu_event_start,
+    cpu_event_finish,
+):
+    import torch
+    import table_batched_embeddings
+
+    cpu_event_start.record()
+    gpu_output = table_batched_embeddings.lxu_cache_forward_mixed_cuda(
+        weights,
+        indices,
+        offsets,
+        None,
+        lxu_cache_locations,
+        lxu_cache_weights,
+        B_block_size,
+    )
+    with torch.cuda.stream(cpu_stream):
+        cpu_event_start.wait()
+        table_batched_embeddings.lxu_cache_forward_cpu(
+            weights,
+            indices_cpu,
+            offsets_cpu,
+            None,
+            mask_cpu,
+            output_cpu,
+            handle,
+        )
+        output_cpu_gpu = output_cpu.to(gpu_output.device, non_blocking=True)
+        cpu_event_finish.record()
+    cpu_event_finish.wait()
+    return gpu_output + output_cpu_gpu
+
+# def lxu_cache_forward_mixed_cpu_cuda(
+#     weights,
+#     indices,
+#     offsets,
+#     lxu_cache_locations,
+#     lxu_cache_weights,
+#     B_block_size,
+#     indices_cpu,
+#     offsets_cpu,
+#     mask_cpu,
+#     output_cpu,
+#     handle,
+#     cpu_stream,
+#     cpu_event_start,
+#     cpu_event_finish,
+# ):
+#     import torch
+#     import table_batched_embeddings
+
+#     gpu_output = table_batched_embeddings.lxu_cache_forward_mixed_cuda(
+#         weights,
+#         indices,
+#         offsets,
+#         None,
+#         lxu_cache_locations,
+#         lxu_cache_weights,
+#         B_block_size,
+#     )
+#     table_batched_embeddings.lxu_cache_forward_cpu(
+#         weights,
+#         indices_cpu,
+#         offsets_cpu,
+#         None,
+#         mask_cpu,
+#         output_cpu,
+#         handle,
+#     )
+#     return gpu_output + output_cpu.to(gpu_output.device)    
