@@ -1,6 +1,6 @@
 #include <ATen/ATen.h>
 #include <ATen/AccumulateType.h>
-#include <ATen/CUDAGenerator.h>
+#include <ATen/CUDAGeneratorImpl.h>
 #include <ATen/core/TensorAccessor.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -15,6 +15,7 @@
 using namespace at;
 
 #define DEVICE_INLINE __device__ inline __attribute__((always_inline))
+#define __HALF2_TO_UI(var) *(reinterpret_cast<unsigned int *>(&(var)))
 
 namespace {
 
@@ -765,8 +766,8 @@ c10::optional<Tensor> batched_embedding_backward_adagrad_approx_cuda(
           std::pair<uint64_t, uint64_t> rng_engine_inputs;
           {
             auto gen = at::cuda::detail::getDefaultCUDAGenerator();
-            std::lock_guard<std::mutex> lock(gen->mutex_);
-            rng_engine_inputs = gen->philox_engine_inputs(
+            std::lock_guard<std::mutex> lock(gen.mutex());
+            rng_engine_inputs = at::check_generator<at::CUDAGeneratorImpl>(gen)->philox_engine_inputs(
                 L_max * ((D + kWarpSize - 1) / kWarpSize));
           }
           if (indice_weights) {
@@ -863,7 +864,7 @@ int64_t computeStorageSize(IntArrayRef sizes, IntArrayRef strides) {
 
 Tensor new_managed_tensor(Tensor self, std::vector<std::int64_t> sizes) {
   auto strides = defaultStrides(sizes);
-  auto storage = Storage(self.dtype(), computeStorageSize(sizes, strides),
+  auto storage = Storage(Storage::use_byte_size_t(), computeStorageSize(sizes, strides),
                          &g_managed_allocator,
                          /*resizable=*/false);
   auto tensor = at::empty({0}, self.options()).set_(storage, 0, sizes, strides);
@@ -872,7 +873,7 @@ Tensor new_managed_tensor(Tensor self, std::vector<std::int64_t> sizes) {
 
 Tensor new_host_mapped_tensor(Tensor self, std::vector<std::int64_t> sizes) {
   auto strides = defaultStrides(sizes);
-  auto storage = Storage(self.dtype(), computeStorageSize(sizes, strides),
+  auto storage = Storage(Storage::use_byte_size_t(), computeStorageSize(sizes, strides),
                          &g_host_mapped_allocator,
                          /*resizable=*/false);
   auto tensor = at::empty({0}, self.options()).set_(storage, 0, sizes, strides);
@@ -1135,8 +1136,8 @@ c10::optional<Tensor> batched_embedding_backward_adagrad_approx_mixed_D_cuda(
           std::pair<uint64_t, uint64_t> rng_engine_inputs;
           {
             auto gen = at::cuda::detail::getDefaultCUDAGenerator();
-            std::lock_guard<std::mutex> lock(gen->mutex_);
-            rng_engine_inputs = gen->philox_engine_inputs(
+            std::lock_guard<std::mutex> lock(gen.mutex());
+            rng_engine_inputs = at::check_generator<at::CUDAGeneratorImpl>(gen)->philox_engine_inputs(
                 L_max * ((total_D + kWarpSize - 1) / kWarpSize));
           }
           if (indice_weights) {
@@ -1448,8 +1449,8 @@ c10::optional<Tensor> batched_embedding_backward_adagrad_exact_mixed_D_cuda(
           std::pair<uint64_t, uint64_t> rng_engine_inputs;
           {
             auto gen = at::cuda::detail::getDefaultCUDAGenerator();
-            std::lock_guard<std::mutex> lock(gen->mutex_);
-            rng_engine_inputs = gen->philox_engine_inputs(
+            std::lock_guard<std::mutex> lock(gen.mutex());
+            rng_engine_inputs = at::check_generator<at::CUDAGeneratorImpl>(gen)->philox_engine_inputs(
                 ((total_D + kWarpSize - 1) / kWarpSize));
           }
           if (indice_weights) {
@@ -1685,17 +1686,17 @@ c10::optional<Tensor> batched_embedding_backward_adagrad_exact_cuda(
           std::pair<uint64_t, uint64_t> rng_engine_inputs;
           {
             auto gen = at::cuda::detail::getDefaultCUDAGenerator();
-            std::lock_guard<std::mutex> lock(gen->mutex_);
+            std::lock_guard<std::mutex> lock(gen.mutex());
             rng_engine_inputs =
-                gen->philox_engine_inputs(((D + kWarpSize - 1) / kWarpSize));
+                at::check_generator<at::CUDAGeneratorImpl>(gen)->philox_engine_inputs(((D + kWarpSize - 1) / kWarpSize));
           }
-          if (indice_weights) {
-            AT_ASSERT(false);
-          } else {
-            auto f = StochasticRoundingAdaGradFunctor<scalar_t, false>(
-                learning_rate, eps, rng_engine_inputs);
-            X(f);
-          }
+          // if (indice_weights) {
+          //   AT_ASSERT(false);
+          // } else {
+          //   auto f = StochasticRoundingAdaGradFunctor<scalar_t, false>(
+          //       learning_rate, eps, rng_engine_inputs);
+          //   X(f);
+          // }
         }
       }));
   AT_CUDA_CHECK(cudaGetLastError());

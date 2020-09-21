@@ -1,13 +1,7 @@
-import click
-
 import numpy as np
-import logging
-
-logging.basicConfig(level=logging.DEBUG)
-import sys
-
-import torch
+import torch, logging, click, sys, functools
 import table_batched_embeddings_ops
+logging.basicConfig(level=logging.DEBUG)
 
 
 def div_round_up(a, b):
@@ -35,9 +29,6 @@ def benchmark_torch_function(iters, f, *args):
     end_event.record()
     torch.cuda.synchronize()
     return (start_event.elapsed_time(end_event) * 1.0e-3) / iters
-
-
-import functools
 
 
 def div_round_up(a, b):
@@ -364,7 +355,6 @@ def benchmark_forward(B, E, T, L, D, iters, fp16, managed, mixed):
 @click.option("--batch-size", default=128)
 @click.option("--bag-size", default=32)
 @click.option("--iters", default=100)
-@click.option("--remote", is_flag=True, default=False)
 @click.option("--fp16", is_flag=True, default=False)
 @click.option("--managed", is_flag=True, default=False)
 @click.option("--mixed", is_flag=True, default=False)
@@ -375,14 +365,11 @@ def cli(
     batch_size,
     bag_size,
     iters,
-    remote,
     fp16,
     managed,
     mixed,
 ):
     def f():
-        import torch
-
         benchmark_forward(
             batch_size,
             num_embeddings,
@@ -395,25 +382,7 @@ def cli(
             mixed,
         )
 
-    if remote:
-        import submitit
-
-        executor = submitit.AutoExecutor(folder="sparse_embedding_perf")
-        executor.update_parameters(
-            timeout_min=10, partition="dev", constraint="volta32gb", gpus_per_node=1
-        )
-        job = executor.submit(f)
-        job.wait()
-        job.result()
-        logging.info("Finished")
-        import time
-
-        time.sleep(1)
-        print(job.stdout())
-        print(job.stderr(), file=sys.stderr)
-        logging.info("Finished")
-    else:
-        f()
+    f()
 
 
 if __name__ == "__main__":

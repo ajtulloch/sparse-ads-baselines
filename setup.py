@@ -4,7 +4,7 @@ setup(name='table_batched_embeddings',
       ext_modules=[
           CUDAExtension(
               name='table_batched_embeddings',
-              include_dirs=['/private/home/tulloch/src/'],
+              include_dirs=['/home/zhongyilin/Documents/pytorch/aten/src', '/home/zhongyilin/Documents/cub'],
               sources=[
                   'table_batched_embeddings.cpp',
                   'table_batched_embeddings_cuda.cu'
