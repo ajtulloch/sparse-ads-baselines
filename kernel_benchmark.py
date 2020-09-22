@@ -18,14 +18,14 @@ def get_table_batched_offsets_from_dense(merged_indices):
     )
 
 
-def benchmark_torch_function(iters, f, *args):
-    f(*args)
+def benchmark_torch_function(iters, f, *args, **kwargs):
+    f(*args, **kwargs)
     torch.cuda.synchronize()
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
     start_event.record()
     for i in range(iters):
-        f(*args)
+        f(*args, **kwargs)
     end_event.record()
     torch.cuda.synchronize()
     return (start_event.elapsed_time(end_event) * 1.0e-3) / iters
@@ -33,6 +33,23 @@ def benchmark_torch_function(iters, f, *args):
 
 def div_round_up(a, b):
     return int(((a + b - 1) // b) * b)
+
+
+def benchmark_concat(batch_size, M, N, K, iters):
+    A = torch.randn(batch_size, M, K).cuda()
+    B = torch.randn(batch_size, N, K).cuda()
+
+    time_per_iter = benchmark_torch_function(
+        iters,
+        torch.cat,
+        (A, B),
+        dim=1
+    )
+
+    logging.info(
+        f"Concat, tensor A size: ({batch_size}, {M}, {K}), tensor B size: ({batch_size}, {N}, {K}),\
+            BW: {2 * (batch_size * M * K + batch_size * N * K) / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
+    )
 
 
 def benchmark_forward(B, E, T, L, D, iters, fp16, managed, mixed):
@@ -349,27 +366,35 @@ def benchmark_forward(B, E, T, L, D, iters, fp16, managed, mixed):
 
 
 @click.command()
-@click.option("--num-tables", default=64)
-@click.option("--num-embeddings", default=int(1e4))
-@click.option("--embedding-dim", default=32)
+@click.option("--op-type", default="embedding_lookup")
 @click.option("--batch-size", default=128)
+@click.option("--num-embeddings", default=int(1e4))
+@click.option("--num-tables", default=64)
 @click.option("--bag-size", default=32)
+@click.option("--embedding-dim", default=32)
 @click.option("--iters", default=100)
+@click.option("--M", default=512)
+@click.option("--N", default=512)
+@click.option("--K", default=512)
 @click.option("--fp16", is_flag=True, default=False)
 @click.option("--managed", is_flag=True, default=False)
 @click.option("--mixed", is_flag=True, default=False)
 def cli(
-    num_tables,
-    num_embeddings,
-    embedding_dim,
+    op_type,
     batch_size,
+    num_embeddings,
+    num_tables,
     bag_size,
+    embedding_dim,
     iters,
+    m,
+    n,
+    k,
     fp16,
     managed,
     mixed,
 ):
-    def f():
+    if op_type == "embedding_lookup":
         benchmark_forward(
             batch_size,
             num_embeddings,
@@ -381,8 +406,16 @@ def cli(
             managed,
             mixed,
         )
-
-    f()
+    elif op_type == "concat":
+        benchmark_concat(
+            batch_size,
+            m,
+            n,
+            k,
+            iters,
+        )
+    else:
+        raise Exception("Op type not supported!")
 
 
 if __name__ == "__main__":
