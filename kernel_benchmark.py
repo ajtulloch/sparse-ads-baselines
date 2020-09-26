@@ -52,6 +52,21 @@ def benchmark_concat(batch_size, M, N, K, iters):
     )
 
 
+def benchmark_memcpy(batch_size, M, N, iters):
+    A = torch.randn(batch_size, M, N)
+
+    time_per_iter = benchmark_torch_function(
+        iters,
+        A.to,
+        device="cuda"
+    )
+
+    logging.info(
+        f"Memcpy, size: ({batch_size}, {M}, {N}), \
+            BW: {(batch_size * M * N) / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
+    )
+
+
 def benchmark_forward(B, E, T, L, D, iters, fp16, managed, mixed):
     logging.basicConfig(level=logging.DEBUG)
     import torch
@@ -412,6 +427,13 @@ def cli(
             m,
             n,
             k,
+            iters,
+        )
+    elif op_type == "memcpy":
+        benchmark_memcpy(
+            batch_size,
+            m,
+            n,
             iters,
         )
     else:
