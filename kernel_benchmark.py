@@ -31,10 +31,6 @@ def benchmark_torch_function(iters, f, *args, **kwargs):
     return (start_event.elapsed_time(end_event) * 1.0e-3) / iters
 
 
-def div_round_up(a, b):
-    return int(((a + b - 1) // b) * b)
-
-
 def benchmark_concat(batch_size, M, N, K, iters):
     A = torch.randn(batch_size, M, K).cuda()
     B = torch.randn(batch_size, N, K).cuda()
