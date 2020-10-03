@@ -519,3 +519,6 @@ def test_backward_adagrad_mixed(
         offsets.requires_grad = False
         cc.embedding_weights.requires_grad = False
         torch.autograd.gradcheck(lambda *args: cc(*args), (indices, offsets, per_sample_weights))
+
+if __name__ == "__main__":
+    test_backward_sgd()

@@ -162,7 +162,10 @@ def benchmark_forward(B, E, T, L, D, iters, fp16, managed, mixed):
 
     merged_indices = torch.randint(low=0, high=E - 1, size=(T, B, L)).int().cuda()
 
+    print(merged_indices.shape)
+
     (indices, offsets) = get_table_batched_offsets_from_dense(merged_indices)
+
     assert indices.shape[0] == B * T * L
     assert all(
         l == L for l in (offsets[1:] - offsets[:-1]).detach().cpu().numpy().tolist()
@@ -263,25 +266,25 @@ def benchmark_forward(B, E, T, L, D, iters, fp16, managed, mixed):
 
     learning_rate = 0.05
     eps = 0.01
-    # for BT_block_size in [1, 2, 4, 8, 16, 32]:
-    #     for shmem in [True, False]:
-    #         time_per_iter = benchmark_torch_function(
-    #             iters,
-    #             w3(table_batched_embeddings.backward_sgd),
-    #             go,
-    #             cc.embedding_weights,
-    #             cc.table_offsets,
-    #             indices,
-    #             offsets,
-    #             learning_rate,
-    #             L,
-    #             BT_block_size,
-    #             shmem,
-    #         )
+    for BT_block_size in [1, 2, 4, 8, 16, 32]:
+        for shmem in [True, False]:
+            time_per_iter = benchmark_torch_function(
+                iters,
+                w3(table_batched_embeddings.backward_sgd),
+                go,
+                cc.embedding_weights,
+                cc.table_offsets,
+                indices,
+                offsets,
+                learning_rate,
+                L,
+                BT_block_size,
+                shmem,
+            )
 
-    #         logging.info(
-    #             f"Backward-SGD, B: {B} {(BT_block_size, shmem)}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {2 * (2 if fp16 else 4) * B * T * L * D / time_per_iter / 1.0e9: .2f}GB/s, T: {time_per_iter * 1.0e6:.0f}us"
-    #         )
+            logging.info(
+                f"Backward-SGD, B: {B} {(BT_block_size, shmem)}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {2 * (2 if fp16 else 4) * B * T * L * D / time_per_iter / 1.0e9: .2f}GB/s, T: {time_per_iter * 1.0e6:.0f}us"
+            )
     for BT_block_size in [
         1,
         2,
@@ -379,9 +382,9 @@ def benchmark_forward(B, E, T, L, D, iters, fp16, managed, mixed):
 @click.command()
 @click.option("--op-type", default="embedding_lookup")
 @click.option("--batch-size", default=128)
-@click.option("--num-embeddings", default=int(1e4))
+@click.option("--num-embeddings", default=1000)
 @click.option("--num-tables", default=64)
-@click.option("--bag-size", default=32)
+@click.option("--bag-size", default=38)
 @click.option("--embedding-dim", default=32)
 @click.option("--iters", default=100)
 @click.option("--M", default=512)

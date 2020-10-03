@@ -148,10 +148,11 @@ class TableBatchedEmbeddingBags(nn.Module):
         import table_batched_embeddings
         super(TableBatchedEmbeddingBags, self).__init__()
         assert managed in (EmbeddingLocation.DEVICE, EmbeddingLocation.HOST_MAPPED)
+        ExT = np.sum(num_embeddings) if isinstance(num_embeddings, (list, np.ndarray)) else num_tables * num_embeddings
         if managed == EmbeddingLocation.DEVICE:
             logging.info("Allocating device embedding bag")
             embedding_data = torch.randn(
-                num_tables * num_embeddings,
+                ExT,
                 embedding_dim,
                 device=torch.cuda.current_device(),
                 dtype=torch.float16 if fp16 else torch.float32,
@@ -159,10 +160,10 @@ class TableBatchedEmbeddingBags(nn.Module):
         elif managed == EmbeddingLocation.HOST_MAPPED:
             logging.info("Allocating host-mapped embedding bag")
             embedding_data = torch.randn(
-                size=(num_tables * num_embeddings, embedding_dim),
+                size=(ExT, embedding_dim),
                 out=table_batched_embeddings.new_managed_tensor(
                     torch.randn(1).cuda() if not fp16 else torch.randn(1).cuda().half(),
-                    (num_tables * num_embeddings, embedding_dim),
+                    (ExT, embedding_dim),
                 ),
             )
 
@@ -171,12 +172,12 @@ class TableBatchedEmbeddingBags(nn.Module):
             "table_offsets",
             torch.tensor(
                 [0]
-                + np.cumsum([num_embeddings for _ in range(num_tables - 1)]).tolist()
+                + np.cumsum(num_embeddings[:-1] if isinstance(num_embeddings, (list, np.ndarray)) else [num_embeddings for _ in range(num_tables - 1)]).tolist()
             ).int(),
         )
         # TODO: unused by SGD
         self.register_buffer(
-            "optimizer_state", torch.zeros(num_tables * num_embeddings).float(),
+            "optimizer_state", torch.zeros(ExT).float(),
         )
 
         self.optimizer = optimizer
