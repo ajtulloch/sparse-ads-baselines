@@ -24,12 +24,64 @@ def benchmark_torch_function(iters, f, *args, **kwargs):
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
     start_event.record()
-    for i in range(iters):
+    for _ in range(iters):
         f(*args, **kwargs)
     end_event.record()
     torch.cuda.synchronize()
     return (start_event.elapsed_time(end_event) * 1.0e-3) / iters
 
+
+def benchmark_fc(batch_size, M, N, K, iters, backward):
+    if batch_size == 1:
+        A = torch.randn(M, K, requires_grad=True).cuda()
+        B = torch.randn(N, K, requires_grad=True).cuda()
+        C = torch.randn(M, N, requires_grad=True).cuda()
+        if not backward:
+            time_per_iter = benchmark_torch_function(
+                iters,
+                torch.addmm,
+                C, A, B.T,
+            )
+            logging.info(
+                f"Addmm, tensor A size: ({M}, {K}), tensor B size: ({N}, {K}),\
+                    BW: {(M * K + N * K + M * N) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
+            )
+        else:
+            torch.addmm(C, A, B.T)
+            time_per_iter = benchmark_torch_function(
+                iters,
+                C.mean().backward,
+                retain_graph=True,
+            )
+            logging.info(
+                f"AddmmBackward, tensor A size: ({M}, {K}), tensor B size: ({N}, {K}),\
+                    BW: {(M * K + N * K + M * N) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
+            )
+
+    else:
+        A = torch.randn(batch_size, M, K, requires_grad=True).cuda()
+        B = torch.randn(batch_size, N, K, requires_grad=True).cuda()
+        if not backward:
+            time_per_iter = benchmark_torch_function(
+                iters,
+                torch.bmm,
+                A, torch.transpose(B, 1, 2),
+            )
+            logging.info(
+                f"Bmm, tensor A size: ({batch_size}, {M}, {K}), tensor B size: ({batch_size}, {N}, {K}),\
+                    BW: {batch_size * (M * K + N * K + M * N) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
+            )
+        else:
+            C = torch.bmm(A, torch.transpose(B, 1, 2))
+            time_per_iter = benchmark_torch_function(
+                iters,
+                C.mean().backward,
+                retain_graph=True,
+            )
+            logging.info(
+                f"BmmBackward, tensor A size: ({batch_size}, {M}, {K}), tensor B size: ({batch_size}, {N}, {K}),\
+                    BW: {batch_size * (M * K + N * K + M * N) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
+            )
 
 def benchmark_concat(batch_size, M, N, K, iters):
     A = torch.randn(batch_size, M, K).cuda()
@@ -44,7 +96,7 @@ def benchmark_concat(batch_size, M, N, K, iters):
 
     logging.info(
         f"Concat, tensor A size: ({batch_size}, {M}, {K}), tensor B size: ({batch_size}, {N}, {K}),\
-            BW: {2 * (batch_size * M * K + batch_size * N * K) / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
+            BW: {2 * (batch_size * M * K + batch_size * N * K) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
     )
 
 
@@ -59,7 +111,7 @@ def benchmark_memcpy(batch_size, M, N, iters):
 
     logging.info(
         f"Memcpy, size: ({batch_size}, {M}, {N}), \
-            BW: {(batch_size * M * N) / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
+            BW: {(batch_size * M * N) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
     )
 
 
@@ -381,6 +433,7 @@ def benchmark_forward(B, E, T, L, D, iters, fp16, managed, mixed):
 
 @click.command()
 @click.option("--op-type", default="embedding_lookup")
+@click.option("--backward", is_flag=True, default=False)
 @click.option("--batch-size", default=128)
 @click.option("--num-embeddings", default=1000)
 @click.option("--num-tables", default=64)
@@ -395,6 +448,7 @@ def benchmark_forward(B, E, T, L, D, iters, fp16, managed, mixed):
 @click.option("--mixed", is_flag=True, default=False)
 def cli(
     op_type,
+    backward,
     batch_size,
     num_embeddings,
     num_tables,
@@ -419,6 +473,15 @@ def cli(
             fp16,
             managed,
             mixed,
+        )
+    if op_type == "fully_connected":
+        benchmark_fc(
+            batch_size,
+            m,
+            n,
+            k,
+            iters,
+            backward,
         )
     elif op_type == "concat":
         benchmark_concat(
