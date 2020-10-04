@@ -185,6 +185,12 @@ class TableBatchedEmbeddingBags(nn.Module):
         self.eps = eps
         self.stochastic_rounding = stochastic_rounding
 
+        # Digest the input for printing
+        self.T = num_tables
+        self.E_fixed = isinstance(num_embeddings, int)
+        self.E = num_embeddings
+        self.D = embedding_dim
+
     def forward(
         self, sharded_sparse_features, sharded_offsets, per_sample_weights=None
     ):
@@ -200,6 +206,17 @@ class TableBatchedEmbeddingBags(nn.Module):
             self.eps,
             self.stochastic_rounding,
         )
+
+    def extra_repr(self):
+        ret = ''
+        ret += 'Num of tables: {}\n'.format(self.T)
+        if self.E_fixed:
+            ret += 'Num of embeddings per table: {}\n'.format(self.E)
+        else:
+            ret += 'Total num of embeddings: {}\n'.format(np.sum(self.E))
+            ret += 'Embeddings per table: {}\n'.format(','.join([str(x) for x in self.E]))
+        ret += 'Embedding dimension: {}'.format(self.D)
+        return ret
 
 
 class MixedDimLookupFunction(torch.autograd.Function):
