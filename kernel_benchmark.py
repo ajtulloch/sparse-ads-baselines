@@ -115,7 +115,7 @@ def benchmark_memcpy(batch_size, M, N, iters):
     )
 
 
-def benchmark_forward(B, E, T, L, D, iters, fp16, managed, mixed):
+def benchmark_embedding_lookup(B, E, T, L, D, BT_block_size, iters, backward, shmem, sgd, fp16, managed, mixed):
     logging.basicConfig(level=logging.DEBUG)
     import torch
     import table_batched_embeddings
@@ -223,7 +223,8 @@ def benchmark_forward(B, E, T, L, D, iters, fp16, managed, mixed):
         l == L for l in (offsets[1:] - offsets[:-1]).detach().cpu().numpy().tolist()
     )
     per_sample_weights = None
-    print(indices.shape, indices.min(), indices.max(), indices)
+    stochastic = False # TODO: Fix this
+    exact = 1
     y0 = (
         table_batched_embeddings.forward(
             cc.embedding_weights,
@@ -250,76 +251,74 @@ def benchmark_forward(B, E, T, L, D, iters, fp16, managed, mixed):
         )
     )
 
-    for BT_block_size in [1, 2, 4, 8, 16, 32, 64, 128]:
-        for shmem in [True, False]:
-            y = (
-                table_batched_embeddings.forward(
-                    cc.embedding_weights,
-                    cc.table_offsets,
-                    indices,
-                    offsets,
-                    per_sample_weights,
-                    L,
-                    BT_block_size,
-                    shmem,
-                )
-                if not mixed
-                else table_batched_embeddings.forward_mixed_D(
-                    cc.embedding_weights,
-                    cc.table_offsets,
-                    cc.dim_offsets,
-                    cc.total_D,
-                    indices,
-                    offsets,
-                    per_sample_weights,
-                    L,
-                    BT_block_size,
-                    False,
-                )
-            )
-            torch.testing.assert_allclose(y, y0)
+    y = (
+        table_batched_embeddings.forward(
+            cc.embedding_weights,
+            cc.table_offsets,
+            indices,
+            offsets,
+            per_sample_weights,
+            L,
+            BT_block_size,
+            shmem,
+        )
+        if not mixed
+        else table_batched_embeddings.forward_mixed_D(
+            cc.embedding_weights,
+            cc.table_offsets,
+            cc.dim_offsets,
+            cc.total_D,
+            indices,
+            offsets,
+            per_sample_weights,
+            L,
+            BT_block_size,
+            False,
+        )
+    )
+    torch.testing.assert_allclose(y, y0)
 
-    for BT_block_size in [1, 2, 4, 8, 16, 32, 64, 128]:
-        for shmem in [True, False]:
-            time_per_iter = (
-                benchmark_torch_function(
-                    iters,
-                    w2(table_batched_embeddings.forward),
-                    cc.embedding_weights,
-                    cc.table_offsets,
-                    indices,
-                    offsets,
-                    per_sample_weights,
-                    L,
-                    BT_block_size,
-                    shmem,
-                )
-                if not mixed
-                else benchmark_torch_function(
-                    iters,
-                    w4(table_batched_embeddings.forward_mixed_D),
-                    cc.embedding_weights,
-                    cc.table_offsets,
-                    cc.dim_offsets,
-                    cc.total_D,
-                    indices,
-                    offsets,
-                    per_sample_weights,
-                    L,
-                    BT_block_size,
-                    shmem,
-                )
+    if not backward:
+        time_per_iter = (
+            benchmark_torch_function(
+                iters,
+                w2(table_batched_embeddings.forward),
+                cc.embedding_weights,
+                cc.table_offsets,
+                indices,
+                offsets,
+                per_sample_weights,
+                L,
+                BT_block_size,
+                shmem,
             )
-            logging.info(
-                f"Forward, B: {B} {(BT_block_size, shmem)}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {(2 if fp16 else 4) * B * T * L * D / time_per_iter / 1.0e9: .2f}GB/s, T: {time_per_iter * 1.0e6:.0f}us"
+            if not mixed
+            else benchmark_torch_function(
+                iters,
+                w4(table_batched_embeddings.forward_mixed_D),
+                cc.embedding_weights,
+                cc.table_offsets,
+                cc.dim_offsets,
+                cc.total_D,
+                indices,
+                offsets,
+                per_sample_weights,
+                L,
+                BT_block_size,
+                shmem,
             )
+        )
+        logging.info(
+            f"Forward, B: {B} {(BT_block_size, shmem)}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {(2 if fp16 else 4) * B * T * L * D / time_per_iter / 1.0e9: .2f}GB/s, T: {time_per_iter * 1.0e6:.0f}us"
+        )
 
-    go = torch.randn_like(y0)
+    else: # backward
+        go = torch.randn_like(y0)
 
-    learning_rate = 0.05
-    eps = 0.01
-    for BT_block_size in [1, 2, 4, 8, 16, 32]:
-        for shmem in [True, False]:
+        learning_rate = 0.05
+        eps = 0.01
+
+        if sgd:
             time_per_iter = benchmark_torch_function(
                 iters,
                 w3(table_batched_embeddings.backward_sgd),
@@ -337,144 +336,145 @@ def benchmark_forward(B, E, T, L, D, iters, fp16, managed, mixed):
             logging.info(
                 f"Backward-SGD, B: {B} {(BT_block_size, shmem)}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {2 * (2 if fp16 else 4) * B * T * L * D / time_per_iter / 1.0e9: .2f}GB/s, T: {time_per_iter * 1.0e6:.0f}us"
             )
-    for BT_block_size in [
-        1,
-        2,
-        4,
-        8,
-        16,
-        32,
-    ]:
-        for exact in [0, 1]:
-            for stochastic in [0, 1] if fp16 else [0]:
-                if not exact:
-                    time_per_iter = (
-                        benchmark_torch_function(
-                            iters,
-                            w3(table_batched_embeddings.backward_approx_adagrad),
-                            go,
-                            cc.embedding_weights,
-                            cc.table_offsets,
-                            indices,
-                            offsets,
-                            per_sample_weights,
-                            cc.optimizer_state,
-                            learning_rate,
-                            eps,
-                            L,
-                            stochastic,
-                            BT_block_size,
-                        )
-                        if not mixed
-                        else benchmark_torch_function(
-                            iters,
-                            w6(
-                                table_batched_embeddings.backward_approx_adagrad_mixed_D
-                            ),
-                            go,
-                            cc.embedding_weights,
-                            cc.table_offsets,
-                            cc.table_dim_offsets,
-                            cc.dim_offsets,
-                            cc.total_D,
-                            indices,
-                            offsets,
-                            per_sample_weights,
-                            cc.optimizer_state,
-                            learning_rate,
-                            eps,
-                            L,
-                            stochastic,
-                            BT_block_size,
-                        )
+        else: # adagrad
+            if not exact:
+                time_per_iter = (
+                    benchmark_torch_function(
+                        iters,
+                        w3(table_batched_embeddings.backward_approx_adagrad),
+                        go,
+                        cc.embedding_weights,
+                        cc.table_offsets,
+                        indices,
+                        offsets,
+                        per_sample_weights,
+                        cc.optimizer_state,
+                        learning_rate,
+                        eps,
+                        L,
+                        stochastic,
+                        BT_block_size,
                     )
-                else:
-                    time_per_iter = (
-                        benchmark_torch_function(
-                            iters,
-                            w3(table_batched_embeddings.backward_exact_adagrad),
-                            go,
-                            cc.embedding_weights,
-                            cc.table_offsets,
-                            indices,
-                            offsets,
-                            per_sample_weights,
-                            cc.optimizer_state,
-                            learning_rate,
-                            eps,
-                            stochastic,
-                            BT_block_size,
-                        )
-                        if not mixed
-                        else benchmark_torch_function(
-                            iters,
-                            w6(table_batched_embeddings.backward_exact_adagrad_mixed_D),
-                            go,
-                            cc.embedding_weights,
-                            cc.table_offsets,
-                            cc.table_dim_offsets,
-                            cc.dim_offsets,
-                            cc.total_D,
-                            indices,
-                            offsets,
-                            per_sample_weights,
-                            cc.optimizer_state,
-                            learning_rate,
-                            eps,
-                            stochastic,
-                            BT_block_size,
-                        )
+                    if not mixed
+                    else benchmark_torch_function(
+                        iters,
+                        w6(
+                            table_batched_embeddings.backward_approx_adagrad_mixed_D
+                        ),
+                        go,
+                        cc.embedding_weights,
+                        cc.table_offsets,
+                        cc.table_dim_offsets,
+                        cc.dim_offsets,
+                        cc.total_D,
+                        indices,
+                        offsets,
+                        per_sample_weights,
+                        cc.optimizer_state,
+                        learning_rate,
+                        eps,
+                        L,
+                        stochastic,
+                        BT_block_size,
                     )
-
-                logging.info(
-                    f"Backward-ADAGRAD-{'nonstochastic' if not stochastic else 'stochastic'}-{'EXACT' if exact else 'APPROX'}-{'R' if R else 'NR'}, B: {B} ({BT_block_size}), E: {E}, T: {T}, D: {D}, L: {L}, BW: {2 * (2 if fp16 else 4) * B * T * L * D / time_per_iter / 1.0e9: .2f}GB/s, T: {time_per_iter * 1.0e6:.0f}us"
                 )
+            else:
+                time_per_iter = (
+                    benchmark_torch_function(
+                        iters,
+                        w3(table_batched_embeddings.backward_exact_adagrad),
+                        go,
+                        cc.embedding_weights,
+                        cc.table_offsets,
+                        indices,
+                        offsets,
+                        per_sample_weights,
+                        cc.optimizer_state,
+                        learning_rate,
+                        eps,
+                        stochastic,
+                        BT_block_size,
+                    )
+                    if not mixed
+                    else benchmark_torch_function(
+                        iters,
+                        w6(table_batched_embeddings.backward_exact_adagrad_mixed_D),
+                        go,
+                        cc.embedding_weights,
+                        cc.table_offsets,
+                        cc.table_dim_offsets,
+                        cc.dim_offsets,
+                        cc.total_D,
+                        indices,
+                        offsets,
+                        per_sample_weights,
+                        cc.optimizer_state,
+                        learning_rate,
+                        eps,
+                        stochastic,
+                        BT_block_size,
+                    )
+                )
+
+            logging.info(
+                f"Backward-ADAGRAD-{'nonstochastic' if not stochastic else 'stochastic'}-{'EXACT' if exact else 'APPROX'}-{'R' if R else 'NR'}, B: {B} ({BT_block_size}), E: {E}, T: {T}, D: {D}, L: {L}, BW: {2 * (2 if fp16 else 4) * B * T * L * D / time_per_iter / 1.0e9: .2f}GB/s, T: {time_per_iter * 1.0e6:.0f}us"
+            )
 
 
 @click.command()
 @click.option("--op-type", default="embedding_lookup")
-@click.option("--backward", is_flag=True, default=False)
 @click.option("--batch-size", default=128)
 @click.option("--num-embeddings", default=1000)
 @click.option("--num-tables", default=64)
 @click.option("--bag-size", default=38)
 @click.option("--embedding-dim", default=32)
+@click.option("--rows-per-block", default=32)
 @click.option("--iters", default=100)
 @click.option("--M", default=512)
 @click.option("--N", default=512)
 @click.option("--K", default=512)
+@click.option("--backward", is_flag=True, default=False)
+@click.option("--shmem", is_flag=True, default=False)
+@click.option("--sgd", is_flag=True, default=False)
 @click.option("--fp16", is_flag=True, default=False)
 @click.option("--managed", is_flag=True, default=False)
 @click.option("--mixed", is_flag=True, default=False)
 def cli(
     op_type,
-    backward,
     batch_size,
     num_embeddings,
     num_tables,
     bag_size,
     embedding_dim,
+    rows_per_block,
     iters,
     m,
     n,
     k,
+    backward,
+    shmem,
+    sgd,
     fp16,
     managed,
     mixed,
 ):
     if op_type == "embedding_lookup":
-        benchmark_forward(
+        benchmark_embedding_lookup(
             batch_size,
             num_embeddings,
             num_tables,
             bag_size,
             embedding_dim,
+            rows_per_block,
             iters,
+            backward,
+            shmem,
+            sgd,
             fp16,
             managed,
             mixed,
         )
-    if op_type == "fully_connected":
+    elif op_type == "fully_connected":
         benchmark_fc(
             batch_size,
             m,
