@@ -30,6 +30,19 @@ def benchmark_torch_function(iters, f, *args, **kwargs):
     torch.cuda.synchronize()
     return (start_event.elapsed_time(end_event) * 1.0e-3) / iters
 
+def benchmark_conv(batch_size, H, W, IC, OC, iters, backward):
+    input_feature = torch.randn(batch_size, IC, H, W).cuda()
+    conv = torch.nn.Conv2d(IC, OC, 3, stride=1).cuda()
+
+    time_per_iter = benchmark_torch_function(
+        iters,
+        conv,
+        input_feature
+    )
+    logging.info(
+        f"Conv, input size: ({batch_size}, {IC}, {H}, {W}), filter size (3, 3, {IC}, {OC}) \
+            BW: {(batch_size * H * W * IC + 3 * 3 * IC * OC + batch_size * H * W * OC) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
+    )
 
 def benchmark_fc(batch_size, M, N, K, iters, backward):
     if batch_size == 1:
@@ -111,6 +124,50 @@ def benchmark_memcpy(batch_size, M, N, iters):
 
     logging.info(
         f"Memcpy, size: ({batch_size}, {M}, {N}), \
+            BW: {(batch_size * M * N) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
+    )
+
+
+def benchmark_transpose(batch_size, M, N, trans_type, iters):
+    A = torch.randn(batch_size, M, N).cuda()
+
+    time_per_iter = benchmark_torch_function(
+        iters,
+        torch.transpose,
+        A, 0, -2
+    )
+
+    logging.info(
+        f"Transpose, size: ({batch_size}, {M}, {N}), \
+            BW: {(batch_size * M * N) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
+    )
+
+
+def benchmark_reshape(batch_size, M, N, trans_type, iters):
+    A = torch.randn(batch_size, M, N).cuda()
+
+    # (0, 2, 1): 4.98
+    # (2, 1, 0): 37.64
+    # (1, 0, 2): 3.79
+
+    if trans_type == 0:
+        time_per_iter = benchmark_torch_function(
+            iters,
+            A.permute(0, 2, 1).contiguous
+        )
+    elif trans_type == 1:
+        time_per_iter = benchmark_torch_function(
+            iters,
+            A.permute(2, 1, 0).contiguous
+        )
+    else: # 2
+        time_per_iter = benchmark_torch_function(
+        iters,
+        A.permute(1, 0, 2).contiguous
+    )
+
+    logging.info(
+        f"Reshape, size: ({batch_size}, {M}, {N}), trans_type: {trans_type}, \
             BW: {(batch_size * M * N) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
     )
 
@@ -433,6 +490,11 @@ def benchmark_embedding_lookup(B, E, T, L, D, BT_block_size, iters, backward, sh
 @click.option("--M", default=512)
 @click.option("--N", default=512)
 @click.option("--K", default=512)
+@click.option("--H", default=64)
+@click.option("--W", default=64)
+@click.option("--IC", default=64)
+@click.option("--OC", default=64)
+@click.option("--trans-type", default=0)
 @click.option("--backward", is_flag=True, default=False)
 @click.option("--shmem", is_flag=True, default=False)
 @click.option("--sgd", is_flag=True, default=False)
@@ -451,6 +513,11 @@ def cli(
     m,
     n,
     k,
+    h,
+    w,
+    ic,
+    oc,
+    trans_type,
     backward,
     shmem,
     sgd,
@@ -483,6 +550,16 @@ def cli(
             iters,
             backward,
         )
+    elif op_type == "conv":
+        benchmark_conv(
+            batch_size,
+            h,
+            w,
+            ic,
+            oc,
+            iters,
+            backward,
+        )
     elif op_type == "concat":
         benchmark_concat(
             batch_size,
@@ -496,6 +573,22 @@ def cli(
             batch_size,
             m,
             n,
+            iters,
+        )
+    elif op_type == "transpose":
+            benchmark_transpose(
+            batch_size,
+            m,
+            n,
+            trans_type,
+            iters,
+        )
+    elif op_type == "reshape":
+        benchmark_reshape(
+            batch_size,
+            m,
+            n,
+            trans_type,
             iters,
         )
     else:
