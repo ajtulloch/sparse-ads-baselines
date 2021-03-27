@@ -1,5 +1,5 @@
 import numpy as np
-import torch, logging, click, sys, functools
+import torch, logging, click, functools
 import table_batched_embeddings_ops
 logging.basicConfig(level=logging.DEBUG)
 
@@ -18,24 +18,30 @@ def get_table_batched_offsets_from_dense(merged_indices):
     )
 
 
-def benchmark_torch_function(iters, f, *args, **kwargs):
-    f(*args, **kwargs)
+def benchmark_torch_function(iters, warmup_iters, f, *args, **kwargs):
+    for _ in range(warmup_iters): # Warmup
+        f(*args, **kwargs)
     torch.cuda.synchronize()
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
-    start_event.record()
+    total_time = 0.0
     for _ in range(iters):
+        torch.cuda.synchronize()
+        start_event.record()
         f(*args, **kwargs)
-    end_event.record()
-    torch.cuda.synchronize()
-    return (start_event.elapsed_time(end_event) * 1.0e-3) / iters
+        end_event.record()
+        torch.cuda.synchronize()
+        total_time += start_event.elapsed_time(end_event) * 1.0e-3
+    return total_time / iters
 
-def benchmark_conv(batch_size, H, W, IC, OC, iters, backward):
+
+def benchmark_conv(batch_size, H, W, IC, OC, iters, warmup_iters, backward):
     input_feature = torch.randn(batch_size, IC, H, W).cuda()
     conv = torch.nn.Conv2d(IC, OC, 3, stride=1).cuda()
 
     time_per_iter = benchmark_torch_function(
         iters,
+        warmup_iters,
         conv,
         input_feature
     )
@@ -44,7 +50,36 @@ def benchmark_conv(batch_size, H, W, IC, OC, iters, backward):
             BW: {(batch_size * H * W * IC + 3 * 3 * IC * OC + batch_size * H * W * OC) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
     )
 
-def benchmark_fc(batch_size, M, N, K, iters, backward):
+
+def benchmark_linear(M, N, K, iters, warmup_iters, backward):
+    A = torch.randn(M, K, requires_grad=True).cuda()
+    linear = torch.nn.Linear(K, N).cuda()
+    if not backward:
+        time_per_iter = benchmark_torch_function(
+            iters,
+            warmup_iters,
+            linear,
+            A
+        )
+        logging.info(
+            f"Linear forward, input size: ({M}, {K}), linear in size ({K}), linear out size ({N}),\
+                BW: {(M * K + N * K + M * N) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
+        )
+    else:
+        out = linear(A)
+        time_per_iter = benchmark_torch_function(
+            iters,
+            warmup_iters,
+            out.mean().backward,
+            retain_graph=True,
+        )
+        logging.info(
+            f"Linear backward, input size: ({M}, {K}), linear in size ({K}), linear out size ({N}),\
+                BW: {(M * K + N * K + M * N) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
+        )
+
+
+def benchmark_fc(batch_size, M, N, K, iters, warmup_iters, backward):
     if batch_size == 1:
         A = torch.randn(M, K, requires_grad=True).cuda()
         B = torch.randn(N, K, requires_grad=True).cuda()
@@ -52,22 +87,24 @@ def benchmark_fc(batch_size, M, N, K, iters, backward):
         if not backward:
             time_per_iter = benchmark_torch_function(
                 iters,
+                warmup_iters,
                 torch.addmm,
                 C, A, B.T,
             )
             logging.info(
-                f"Addmm, tensor A size: ({M}, {K}), tensor B size: ({N}, {K}),\
+                f"Addmm, tensor A size: ({M}, {K}), tensor B size: ({K}, {N}),\
                     BW: {(M * K + N * K + M * N) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
             )
         else:
             torch.addmm(C, A, B.T)
             time_per_iter = benchmark_torch_function(
                 iters,
+                warmup_iters,
                 C.mean().backward,
                 retain_graph=True,
             )
             logging.info(
-                f"AddmmBackward, tensor A size: ({M}, {K}), tensor B size: ({N}, {K}),\
+                f"AddmmBackward, tensor A size: ({M}, {K}), tensor B size: ({K}, {N}),\
                     BW: {(M * K + N * K + M * N) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
             )
 
@@ -77,31 +114,35 @@ def benchmark_fc(batch_size, M, N, K, iters, backward):
         if not backward:
             time_per_iter = benchmark_torch_function(
                 iters,
+                warmup_iters,
                 torch.bmm,
                 A, torch.transpose(B, 1, 2),
             )
             logging.info(
-                f"Bmm, tensor A size: ({batch_size}, {M}, {K}), tensor B size: ({batch_size}, {N}, {K}),\
+                f"Bmm, tensor A size: ({batch_size}, {M}, {K}), tensor B size: ({batch_size}, {K}, {N}),\
                     BW: {batch_size * (M * K + N * K + M * N) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
             )
         else:
             C = torch.bmm(A, torch.transpose(B, 1, 2))
             time_per_iter = benchmark_torch_function(
                 iters,
+                warmup_iters,
                 C.mean().backward,
                 retain_graph=True,
             )
             logging.info(
-                f"BmmBackward, tensor A size: ({batch_size}, {M}, {K}), tensor B size: ({batch_size}, {N}, {K}),\
+                f"BmmBackward, tensor A size: ({batch_size}, {M}, {K}), tensor B size: ({batch_size}, {K}, {N}),\
                     BW: {batch_size * (M * K + N * K + M * N) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
             )
 
-def benchmark_concat(batch_size, M, N, K, iters):
+
+def benchmark_concat(batch_size, M, N, K, iters, warmup_iters):
     A = torch.randn(batch_size, M, K).cuda()
     B = torch.randn(batch_size, N, K).cuda()
 
     time_per_iter = benchmark_torch_function(
         iters,
+        warmup_iters,
         torch.cat,
         (A, B),
         dim=1
@@ -113,11 +154,12 @@ def benchmark_concat(batch_size, M, N, K, iters):
     )
 
 
-def benchmark_memcpy(batch_size, M, N, iters):
+def benchmark_memcpy(batch_size, M, N, iters, warmup_iters):
     A = torch.randn(batch_size, M, N)
 
     time_per_iter = benchmark_torch_function(
         iters,
+        warmup_iters,
         A.to,
         device="cuda"
     )
@@ -128,11 +170,12 @@ def benchmark_memcpy(batch_size, M, N, iters):
     )
 
 
-def benchmark_transpose(batch_size, M, N, trans_type, iters):
+def benchmark_transpose(batch_size, M, N, trans_type, iters, warmup_iters):
     A = torch.randn(batch_size, M, N).cuda()
 
     time_per_iter = benchmark_torch_function(
         iters,
+        warmup_iters,
         torch.transpose,
         A, 0, -2
     )
@@ -143,27 +186,25 @@ def benchmark_transpose(batch_size, M, N, trans_type, iters):
     )
 
 
-def benchmark_reshape(batch_size, M, N, trans_type, iters):
+def benchmark_reshape(batch_size, M, N, trans_type, iters, warmup_iters):
     A = torch.randn(batch_size, M, N).cuda()
-
-    # (0, 2, 1): 4.98
-    # (2, 1, 0): 37.64
-    # (1, 0, 2): 3.79
-
     if trans_type == 0:
         time_per_iter = benchmark_torch_function(
             iters,
+            warmup_iters,
             A.permute(0, 2, 1).contiguous
         )
     elif trans_type == 1:
         time_per_iter = benchmark_torch_function(
             iters,
+            warmup_iters,
             A.permute(2, 1, 0).contiguous
         )
     else: # 2
         time_per_iter = benchmark_torch_function(
-        iters,
-        A.permute(1, 0, 2).contiguous
+            iters,
+            warmup_iters,
+            A.permute(1, 0, 2).contiguous
     )
 
     logging.info(
@@ -172,7 +213,22 @@ def benchmark_reshape(batch_size, M, N, trans_type, iters):
     )
 
 
-def benchmark_embedding_lookup(B, E, T, L, D, BT_block_size, iters, backward, shmem, sgd, fp16, managed, mixed):
+def benchmark_relu(batch_size, M, N, iters, warmup_iters):
+    A = torch.randn(batch_size, M, N).cuda()
+    time_per_iter = benchmark_torch_function(
+        iters,
+        warmup_iters,
+        torch.relu,
+        A
+    )
+
+    logging.info(
+        f"ReLU, size: ({batch_size}, {M}, {N}), \
+            BW: {(batch_size * M * N) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
+    )
+
+
+def benchmark_embedding_lookup(B, E, T, L, D, BT_block_size, iters, warmup_iters, backward, shmem, sgd, fp16, managed, mixed):
     logging.basicConfig(level=logging.DEBUG)
     import torch
     import table_batched_embeddings
@@ -339,6 +395,7 @@ def benchmark_embedding_lookup(B, E, T, L, D, BT_block_size, iters, backward, sh
         time_per_iter = (
             benchmark_torch_function(
                 iters,
+                warmup_iters,
                 w2(table_batched_embeddings.forward),
                 cc.embedding_weights,
                 cc.table_offsets,
@@ -352,6 +409,7 @@ def benchmark_embedding_lookup(B, E, T, L, D, BT_block_size, iters, backward, sh
             if not mixed
             else benchmark_torch_function(
                 iters,
+                warmup_iters,
                 w4(table_batched_embeddings.forward_mixed_D),
                 cc.embedding_weights,
                 cc.table_offsets,
@@ -378,6 +436,7 @@ def benchmark_embedding_lookup(B, E, T, L, D, BT_block_size, iters, backward, sh
         if sgd:
             time_per_iter = benchmark_torch_function(
                 iters,
+                warmup_iters,
                 w3(table_batched_embeddings.backward_sgd),
                 go,
                 cc.embedding_weights,
@@ -398,6 +457,7 @@ def benchmark_embedding_lookup(B, E, T, L, D, BT_block_size, iters, backward, sh
                 time_per_iter = (
                     benchmark_torch_function(
                         iters,
+                        warmup_iters,
                         w3(table_batched_embeddings.backward_approx_adagrad),
                         go,
                         cc.embedding_weights,
@@ -415,6 +475,7 @@ def benchmark_embedding_lookup(B, E, T, L, D, BT_block_size, iters, backward, sh
                     if not mixed
                     else benchmark_torch_function(
                         iters,
+                        warmup_iters,
                         w6(
                             table_batched_embeddings.backward_approx_adagrad_mixed_D
                         ),
@@ -439,6 +500,7 @@ def benchmark_embedding_lookup(B, E, T, L, D, BT_block_size, iters, backward, sh
                 time_per_iter = (
                     benchmark_torch_function(
                         iters,
+                        warmup_iters,
                         w3(table_batched_embeddings.backward_exact_adagrad),
                         go,
                         cc.embedding_weights,
@@ -455,6 +517,7 @@ def benchmark_embedding_lookup(B, E, T, L, D, BT_block_size, iters, backward, sh
                     if not mixed
                     else benchmark_torch_function(
                         iters,
+                        warmup_iters,
                         w6(table_batched_embeddings.backward_exact_adagrad_mixed_D),
                         go,
                         cc.embedding_weights,
@@ -487,6 +550,7 @@ def benchmark_embedding_lookup(B, E, T, L, D, BT_block_size, iters, backward, sh
 @click.option("--embedding-dim", default=32)
 @click.option("--rows-per-block", default=32)
 @click.option("--iters", default=100)
+@click.option("--warmup-iters", default=5)
 @click.option("--M", default=512)
 @click.option("--N", default=512)
 @click.option("--K", default=512)
@@ -510,6 +574,7 @@ def cli(
     embedding_dim,
     rows_per_block,
     iters,
+    warmup_iters,
     m,
     n,
     k,
@@ -534,6 +599,7 @@ def cli(
             embedding_dim,
             rows_per_block,
             iters,
+            warmup_iters,
             backward,
             shmem,
             sgd,
@@ -548,6 +614,16 @@ def cli(
             n,
             k,
             iters,
+            warmup_iters,
+            backward,
+        )
+    elif op_type == "linear":
+        benchmark_linear(
+            m,
+            n,
+            k,
+            iters,
+            warmup_iters,
             backward,
         )
     elif op_type == "conv":
@@ -558,6 +634,7 @@ def cli(
             ic,
             oc,
             iters,
+            warmup_iters,
             backward,
         )
     elif op_type == "concat":
@@ -567,6 +644,7 @@ def cli(
             n,
             k,
             iters,
+            warmup_iters,
         )
     elif op_type == "memcpy":
         benchmark_memcpy(
@@ -574,6 +652,7 @@ def cli(
             m,
             n,
             iters,
+            warmup_iters,
         )
     elif op_type == "transpose":
             benchmark_transpose(
@@ -582,6 +661,7 @@ def cli(
             n,
             trans_type,
             iters,
+            warmup_iters,
         )
     elif op_type == "reshape":
         benchmark_reshape(
@@ -590,6 +670,15 @@ def cli(
             n,
             trans_type,
             iters,
+            warmup_iters,
+        )
+    elif op_type == "relu":
+        benchmark_relu(
+            batch_size,
+            m,
+            n,
+            iters,
+            warmup_iters,
         )
     else:
         raise Exception("Op type not supported!")
