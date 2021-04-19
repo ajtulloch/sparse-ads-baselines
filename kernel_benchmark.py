@@ -1,8 +1,8 @@
 import numpy as np
 import torch, logging, click, functools
-import table_batched_embeddings_ops
+import table_batched_embeddings, table_batched_embeddings_ops
 logging.basicConfig(level=logging.DEBUG)
-
+np.random.seed(42)
 
 def div_round_up(a, b):
     return int((a + b - 1) // b) * b
@@ -39,16 +39,28 @@ def benchmark_conv(batch_size, H, W, IC, OC, iters, warmup_iters, backward):
     input_feature = torch.randn(batch_size, IC, H, W).cuda()
     conv = torch.nn.Conv2d(IC, OC, 3, stride=1).cuda()
 
-    time_per_iter = benchmark_torch_function(
-        iters,
-        warmup_iters,
-        conv,
-        input_feature
-    )
-    logging.info(
-        f"Conv, input size: ({batch_size}, {IC}, {H}, {W}), filter size (3, 3, {IC}, {OC}) \
-            BW: {(batch_size * H * W * IC + 3 * 3 * IC * OC + batch_size * H * W * OC) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
-    )
+    if not backward:
+        time_per_iter = benchmark_torch_function(
+            iters,
+            warmup_iters,
+            conv,
+            input_feature
+        )
+        logging.info(
+            f"Conv, input size: ({batch_size}, {IC}, {H}, {W}), filter size (3, 3, {IC}, {OC}) \
+                BW: {(batch_size * H * W * IC + 3 * 3 * IC * OC + batch_size * H * W * OC) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
+        )
+    else:
+        time_per_iter = benchmark_torch_function(
+            iters,
+            warmup_iters,
+            conv.mean().backward,
+            retain_graph=True
+        )
+        logging.info(
+            f"Conv backward, input size: ({batch_size}, {IC}, {H}, {W}), filter size (3, 3, {IC}, {OC}) \
+                BW: {(batch_size * H * W * IC + 3 * 3 * IC * OC + batch_size * H * W * OC) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
+        )
 
 
 def benchmark_linear(M, N, K, iters, warmup_iters, backward):
@@ -172,22 +184,6 @@ def benchmark_memcpy(batch_size, M, N, iters, warmup_iters):
 
 def benchmark_transpose(batch_size, M, N, trans_type, iters, warmup_iters):
     A = torch.randn(batch_size, M, N).cuda()
-
-    time_per_iter = benchmark_torch_function(
-        iters,
-        warmup_iters,
-        torch.transpose,
-        A, 0, -2
-    )
-
-    logging.info(
-        f"Transpose, size: ({batch_size}, {M}, {N}), \
-            BW: {(batch_size * M * N) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
-    )
-
-
-def benchmark_reshape(batch_size, M, N, trans_type, iters, warmup_iters):
-    A = torch.randn(batch_size, M, N).cuda()
     if trans_type == 0:
         time_per_iter = benchmark_torch_function(
             iters,
@@ -208,7 +204,7 @@ def benchmark_reshape(batch_size, M, N, trans_type, iters, warmup_iters):
     )
 
     logging.info(
-        f"Reshape, size: ({batch_size}, {M}, {N}), trans_type: {trans_type}, \
+        f"Transpose, size: ({batch_size}, {M}, {N}), trans_type: {trans_type}, \
             BW: {(batch_size * M * N) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
     )
 
@@ -229,11 +225,11 @@ def benchmark_relu(batch_size, M, N, iters, warmup_iters):
 
 
 def benchmark_embedding_lookup(B, E, T, L, D, BT_block_size, iters, warmup_iters, backward, shmem, sgd, fp16, managed, mixed):
-    logging.basicConfig(level=logging.DEBUG)
-    import torch
-    import table_batched_embeddings
+    Es = [int(x) for x in E.split('-')]
+    if len(Es) == 1:
+        Es = Es * T
+    assert len(Es) == T
 
-    np.random.seed(42)
     if mixed:
         mixed_D = [
             div_round_up(np.random.randint(low=int(0.5 * D), high=int(1.5 * D)), 4)
@@ -243,7 +239,7 @@ def benchmark_embedding_lookup(B, E, T, L, D, BT_block_size, iters, warmup_iters
     cc = (
         table_batched_embeddings_ops.TableBatchedEmbeddingBags(
             T,
-            E,
+            Es,
             D,
             optimizer=table_batched_embeddings_ops.Optimizer.APPROX_ROWWISE_ADAGRAD,
             learning_rate=0.1,
@@ -256,7 +252,7 @@ def benchmark_embedding_lookup(B, E, T, L, D, BT_block_size, iters, warmup_iters
         ).cuda()
         if not mixed
         else table_batched_embeddings_ops.MixedDimTableBatchedEmbeddingBags(
-            [(E, d) for d in mixed_D],
+            [(Es, d) for d in mixed_D],
             optimizer=table_batched_embeddings_ops.Optimizer.APPROX_ROWWISE_ADAGRAD,
             learning_rate=0.1,
             managed=table_batched_embeddings_ops.EmbeddingLocation.DEVICE
@@ -314,20 +310,10 @@ def benchmark_embedding_lookup(B, E, T, L, D, BT_block_size, iters, warmup_iters
 
         return z
 
-    zs = [
-        torch.tensor(np.random.zipf(a=1.2, size=(B, L))).int().cuda()
-        % E
-        # torch.randint(low=0, high=E - 1, size=(T, B, L)).int().cuda()
-    ]
-
-    print(
-        f"Duplicate proportion: {1.0 - np.unique(zs[0].detach().cpu().numpy()).size / zs[0].detach().cpu().numpy().size}"
-    )
-    merged_indices = torch.stack(zs, dim=0)
-
-    merged_indices = torch.randint(low=0, high=E - 1, size=(T, B, L)).int().cuda()
-
-    print(merged_indices.shape)
+    idxs = []
+    for x in range(T):
+        idxs.append(torch.randint(low=0, high=Es[x] - 1, size=(B, L)).int().cuda())
+    merged_indices = torch.stack(idxs, dim=0)
 
     (indices, offsets) = get_table_batched_offsets_from_dense(merged_indices)
 
@@ -424,7 +410,7 @@ def benchmark_embedding_lookup(B, E, T, L, D, BT_block_size, iters, warmup_iters
             )
         )
         logging.info(
-            f"Forward, B: {B} {(BT_block_size, shmem)}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {(2 if fp16 else 4) * B * T * L * D / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
+            f"Embedding Lookup Forward, B: {B} {(BT_block_size, shmem)}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {(2 if fp16 else 4) * B * T * L * D / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
         )
 
     else: # backward
@@ -450,7 +436,7 @@ def benchmark_embedding_lookup(B, E, T, L, D, BT_block_size, iters, warmup_iters
             )
 
             logging.info(
-                f"Backward-SGD, B: {B} {(BT_block_size, shmem)}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {2 * (2 if fp16 else 4) * B * T * L * D / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
+                f"Embedding Lookup Backward-SGD, B: {B} {(BT_block_size, shmem)}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {2 * (2 if fp16 else 4) * B * T * L * D / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
             )
         else: # adagrad
             if not exact:
@@ -537,14 +523,14 @@ def benchmark_embedding_lookup(B, E, T, L, D, BT_block_size, iters, warmup_iters
                 )
 
             logging.info(
-                f"Backward-ADAGRAD-{'nonstochastic' if not stochastic else 'stochastic'}-{'EXACT' if exact else 'APPROX'}-{'R' if R else 'NR'}, B: {B} ({BT_block_size}), E: {E}, T: {T}, D: {D}, L: {L}, BW: {2 * (2 if fp16 else 4) * B * T * L * D / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
+                f"Embedding Lookup Backward-ADAGRAD-{'nonstochastic' if not stochastic else 'stochastic'}-{'EXACT' if exact else 'APPROX'}-{'R' if R else 'NR'}, B: {B} ({BT_block_size}), E: {E}, T: {T}, D: {D}, L: {L}, BW: {2 * (2 if fp16 else 4) * B * T * L * D / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
             )
 
 
 @click.command()
 @click.option("--op-type", default="embedding_lookup")
 @click.option("--batch-size", default=128)
-@click.option("--num-embeddings", default=1000)
+@click.option("--num-embeddings", default="1000") # str by default in case 'x-y-z'
 @click.option("--num-tables", default=64)
 @click.option("--bag-size", default=38)
 @click.option("--embedding-dim", default=32)
@@ -656,15 +642,6 @@ def cli(
         )
     elif op_type == "transpose":
             benchmark_transpose(
-            batch_size,
-            m,
-            n,
-            trans_type,
-            iters,
-            warmup_iters,
-        )
-    elif op_type == "reshape":
-        benchmark_reshape(
             batch_size,
             m,
             n,
