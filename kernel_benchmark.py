@@ -333,7 +333,7 @@ def benchmark_embedding_lookup(B, E, T, L, D, BT_block_size, iters, warmup_iters
             per_sample_weights,
             L,
             1,
-            False,
+            shmem,
         )
         if not mixed
         else table_batched_embeddings.forward_mixed_D(
@@ -346,7 +346,7 @@ def benchmark_embedding_lookup(B, E, T, L, D, BT_block_size, iters, warmup_iters
             per_sample_weights,
             L,
             1,
-            False,
+            shmem,
         )
     )
 
