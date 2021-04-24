@@ -147,6 +147,40 @@ def benchmark_fc(batch_size, M, N, K, iters, warmup_iters, backward):
                     BW: {batch_size * (M * K + N * K + M * N) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
             )
 
+def benchmark_tril(batch_size, M, N, diag, iters, warmup_iters, backward):
+    assert M == N, "Input tensor should be square!"
+    Z = torch.randn(batch_size, M, N, requires_grad=True).cuda()
+    li = torch.tensor([i for i in range(M) for j in range(i + diag)])
+    lj = torch.tensor([j for i in range(N) for j in range(i + diag)])
+    def zflat_wrapper(Z, i, j):
+        return Z[:, i, j]
+
+    if not backward:
+        time_per_iter = benchmark_torch_function(
+            iters,
+            warmup_iters,
+            zflat_wrapper,
+            Z,
+            li,
+            lj
+        )
+        logging.info(
+            f"Index forward, tensor size: ({batch_size}, {M}, {N}),\
+                BW: unknown, Time: {time_per_iter * 1.0e6:.0f}us"
+        )
+    else:
+        out = zflat_wrapper(Z, li, lj)
+        time_per_iter = benchmark_torch_function(
+            iters,
+            warmup_iters,
+            out.mean().backward,
+            retain_graph=True,
+        )
+        logging.info(
+            f"Index forward, tensor size: ({batch_size}, {M}, {N}),\
+                BW: unknown, Time: {time_per_iter * 1.0e6:.0f}us"
+        )
+
 
 def benchmark_concat(batch_size, M, N, K, iters, warmup_iters):
     A = torch.randn(batch_size, M, K).cuda()
@@ -529,52 +563,57 @@ def benchmark_embedding_lookup(B, E, T, L, D, BT_block_size, iters, warmup_iters
 
 @click.command()
 @click.option("--op-type", default="embedding_lookup")
+@click.option("--iters", default=100)
+@click.option("--warmup-iters", default=5)
+@click.option("--backward", is_flag=True, default=False)
 @click.option("--batch-size", default=128)
+# Embedding lookup
 @click.option("--num-embeddings", default="1000") # str by default in case 'x-y-z'
 @click.option("--num-tables", default=64)
 @click.option("--bag-size", default=38)
 @click.option("--embedding-dim", default=32)
 @click.option("--rows-per-block", default=32)
-@click.option("--iters", default=100)
-@click.option("--warmup-iters", default=5)
-@click.option("--M", default=512)
-@click.option("--N", default=512)
-@click.option("--K", default=512)
-@click.option("--H", default=64)
-@click.option("--W", default=64)
-@click.option("--IC", default=64)
-@click.option("--OC", default=64)
-@click.option("--trans-type", default=0)
-@click.option("--backward", is_flag=True, default=False)
 @click.option("--shmem", is_flag=True, default=False)
 @click.option("--sgd", is_flag=True, default=False)
 @click.option("--fp16", is_flag=True, default=False)
 @click.option("--managed", is_flag=True, default=False)
 @click.option("--mixed", is_flag=True, default=False)
+# GEMM and transpose tril and more
+@click.option("--M", default=512)
+@click.option("--N", default=512)
+@click.option("--K", default=512)
+@click.option("--trans-type", default=0)
+@click.option("--diag", default=0)
+# Conv
+@click.option("--H", default=64)
+@click.option("--W", default=64)
+@click.option("--IC", default=64)
+@click.option("--OC", default=64)
 def cli(
     op_type,
+    iters,
+    warmup_iters,
+    backward,
     batch_size,
     num_embeddings,
     num_tables,
     bag_size,
     embedding_dim,
     rows_per_block,
-    iters,
-    warmup_iters,
-    m,
-    n,
-    k,
-    h,
-    w,
-    ic,
-    oc,
-    trans_type,
-    backward,
     shmem,
     sgd,
     fp16,
     managed,
     mixed,
+    m,
+    n,
+    k,
+    trans_type,
+    diag,
+    h,
+    w,
+    ic,
+    oc,
 ):
     if op_type == "embedding_lookup":
         benchmark_embedding_lookup(
@@ -656,6 +695,16 @@ def cli(
             n,
             iters,
             warmup_iters,
+        )
+    elif op_type == "tril":
+        benchmark_tril(
+            batch_size,
+            m,
+            n,
+            diag,
+            iters,
+            warmup_iters,
+            backward,
         )
     else:
         raise Exception("Op type not supported!")
