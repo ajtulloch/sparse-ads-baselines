@@ -3,6 +3,8 @@
 #include <ATen/CUDAGeneratorImpl.h>
 #include <ATen/core/TensorAccessor.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/record_function.h>
+#include <ATen/SequenceNumber.h>
 #include <c10/cuda/CUDAGuard.h>
 
 #include "cub/device/device_radix_sort.cuh"
@@ -256,6 +258,14 @@ Tensor batched_embedding_forward_cuda(Tensor weights, Tensor table_offsets,
                                       c10::optional<Tensor> indice_weights,
                                       int64_t L_max, int64_t BT_block_size,
                                       bool shmem) {
+  auto iv_inputs = std::vector<c10::IValue>();
+  iv_inputs.push_back(c10::IValue(weights));
+  iv_inputs.push_back(c10::IValue(table_offsets));
+  iv_inputs.push_back(c10::IValue(indices));
+  iv_inputs.push_back(c10::IValue(offsets));
+  iv_inputs.push_back(c10::IValue(indice_weights));
+  RECORD_FUNCTION("batched_embedding_forward_cuda", iv_inputs, at::sequence_number::peek());
+
   at::cuda::OptionalCUDAGuard device_guard;
   device_guard.set_index(weights.get_device());
 
@@ -386,6 +396,14 @@ void batched_embedding_backward_sgd_cuda(Tensor grad_output, Tensor weights,
                                          Tensor offsets, float learning_rate,
                                          int64_t L_max, int64_t BT_block_size,
                                          bool shmem) {
+  auto iv_inputs = std::vector<c10::IValue>();
+  iv_inputs.push_back(c10::IValue(grad_output));
+  iv_inputs.push_back(c10::IValue(weights));
+  iv_inputs.push_back(c10::IValue(table_offsets));
+  iv_inputs.push_back(c10::IValue(indices));
+  iv_inputs.push_back(c10::IValue(offsets));
+  RECORD_FUNCTION("batched_embedding_backward_sgd_cuda", iv_inputs, at::sequence_number::peek());
+
   at::cuda::OptionalCUDAGuard device_guard;
   device_guard.set_index(weights.get_device());
 
