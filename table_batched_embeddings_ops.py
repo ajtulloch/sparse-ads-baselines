@@ -1,3 +1,4 @@
+from __future__ import with_statement
 import torch
 from torch import nn
 import numpy as np
@@ -152,8 +153,7 @@ class TableBatchedEmbeddingBags(nn.Module):
         if managed == EmbeddingLocation.DEVICE:
             logging.info("Allocating device embedding bag")
             embedding_data = torch.randn(
-                ExT,
-                embedding_dim,
+                size=(ExT, embedding_dim),
                 device=torch.cuda.current_device(),
                 dtype=torch.float16 if fp16 else torch.float32,
             )
@@ -187,8 +187,7 @@ class TableBatchedEmbeddingBags(nn.Module):
 
         # Digest the input for printing
         self.T = num_tables
-        self.E_fixed = isinstance(num_embeddings, int)
-        self.E = num_embeddings
+        self.Es = num_embeddings if isinstance(num_embeddings, (list, np.ndarray)) else [num_embeddings] * num_tables
         self.D = embedding_dim
 
     def forward(
@@ -210,11 +209,8 @@ class TableBatchedEmbeddingBags(nn.Module):
     def extra_repr(self):
         ret = ''
         ret += 'Num of tables: {}\n'.format(self.T)
-        if self.E_fixed:
-            ret += 'Num of embeddings per table: {}\n'.format(self.E)
-        else:
-            ret += 'Total num of embeddings: {}\n'.format(np.sum(self.E))
-            ret += 'Embeddings per table: {}\n'.format(','.join([str(x) for x in self.E]))
+        ret += 'Total num of embeddings: {}\n'.format(np.sum(self.Es))
+        ret += 'Embeddings per table: {}\n'.format(','.join([str(x) for x in self.Es]))
         ret += 'Embedding dimension: {}'.format(self.D)
         return ret
 
