@@ -9,6 +9,13 @@ Tensor batched_embedding_forward_cuda(Tensor weights, Tensor table_offsets,
                                       int64_t L_max, int64_t BT_block_size,
                                       bool shmem);
 
+Tensor batched_embedding_forward_cuda_permuted( Tensor weights, Tensor table_offsets,
+                                                Tensor indices, Tensor offsets,
+                                                Tensor permuted_offsets_indices,
+                                                c10::optional<Tensor> indice_weights,
+                                                int64_t L_max, int64_t BT_block_size,
+                                                bool shmem);
+
 void batched_embedding_backward_sgd_cuda(Tensor grad_output, Tensor weights,
                                          Tensor table_offsets, Tensor indices,
                                          Tensor offsets, float learning_rate,
@@ -56,6 +63,7 @@ Tensor construct_offsets(Tensor batch_offsets_per_table, // [T][B]
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     m.def("forward", &batched_embedding_forward_cuda);
+    m.def("forward_permuted", &batched_embedding_forward_cuda_permuted);
     m.def("forward_mixed_D", &batched_embedding_forward_mixed_D_cuda);
 
     m.def("backward_sgd", &batched_embedding_backward_sgd_cuda);
