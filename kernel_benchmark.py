@@ -35,9 +35,9 @@ def benchmark_torch_function(iters, warmup_iters, f, *args, **kwargs):
     return total_time / iters
 
 
-def benchmark_conv(batch_size, H, W, IC, OC, stride, FHW, is_dw, iters, warmup_iters, backward):
+def benchmark_conv(batch_size, H, W, IC, OC, stride, dilation, FHW, is_dw, iters, warmup_iters, backward):
     input_feature = torch.randn(batch_size, IC, H, W).cuda()
-    conv = torch.nn.Conv2d(IC, OC, FHW, stride=stride, groups=(IC if is_dw else 1)).cuda()
+    conv = torch.nn.Conv2d(IC, OC, FHW, stride=stride, dilation=dilation, groups=(IC if is_dw else 1)).cuda()
 
     if not backward:
         time_per_iter = benchmark_torch_function(
@@ -590,6 +590,7 @@ def benchmark_embedding_lookup(B, E, T, L, D, BT_block_size, iters, warmup_iters
 @click.option("--IC", default=64)
 @click.option("--OC", default=64)
 @click.option("--stride", default=1)
+@click.option("--dilation", default=1)
 @click.option("--FHW", default=3)
 @click.option("--is-dw", is_flag=True, default=False)
 def cli(
@@ -618,6 +619,7 @@ def cli(
     ic,
     oc,
     stride,
+    dilation,
     fhw,
     is_dw
 ):
@@ -665,6 +667,7 @@ def cli(
             ic,
             oc,
             stride,
+            dilation,
             fhw,
             is_dw,
             iters,
