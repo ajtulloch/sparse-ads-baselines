@@ -47,7 +47,7 @@ def benchmark_conv(batch_size, H, W, IC, OC, stride, dilation, FHW, is_dw, iters
             input_feature
         )
         logging.info(
-            f"Conv, input size: ({batch_size}, {IC}, {H}, {W}), filter size (3, 3, {IC}, {OC}) \
+            f"Conv, input size: ({batch_size}, {IC}, {H}, {W}), filter size ({FHW}, {FHW}, {IC}, {OC}) \
                 BW: {(batch_size * H * W * IC + 3 * 3 * IC * OC + batch_size * H * W * OC) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
         )
     else:
@@ -58,7 +58,7 @@ def benchmark_conv(batch_size, H, W, IC, OC, stride, dilation, FHW, is_dw, iters
             retain_graph=True
         )
         logging.info(
-            f"Conv backward, input size: ({batch_size}, {IC}, {H}, {W}), filter size (3, 3, {IC}, {OC}) \
+            f"Conv backward, input size: ({batch_size}, {IC}, {H}, {W}), filter size ({FHW}, {FHW}, {IC}, {OC}) \
                 BW: {(batch_size * H * W * IC + 3 * 3 * IC * OC + batch_size * H * W * OC) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
         )
 
