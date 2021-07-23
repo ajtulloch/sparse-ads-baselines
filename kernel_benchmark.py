@@ -47,8 +47,8 @@ def benchmark_conv(batch_size, H, W, IC, OC, stride, dilation, FHW, is_dw, iters
             input_feature
         )
         logging.info(
-            f"Conv, input size: ({batch_size}, {IC}, {H}, {W}), filter size ({FHW}, {FHW}, {IC}, {OC}) \
-                BW: {(batch_size * H * W * IC + 3 * 3 * IC * OC + batch_size * H * W * OC) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
+            f"Conv, input size: ({batch_size}, {IC}, {H}, {W}), filter size ({OC}, {IC}, {FHW}, {FHW}) \
+                BW: {(batch_size * H * W * IC + FHW * FHW * IC * OC + batch_size * H * W * OC) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
         )
     else:
         time_per_iter = benchmark_torch_function(
@@ -58,8 +58,8 @@ def benchmark_conv(batch_size, H, W, IC, OC, stride, dilation, FHW, is_dw, iters
             retain_graph=True
         )
         logging.info(
-            f"Conv backward, input size: ({batch_size}, {IC}, {H}, {W}), filter size ({FHW}, {FHW}, {IC}, {OC}) \
-                BW: {(batch_size * H * W * IC + 3 * 3 * IC * OC + batch_size * H * W * OC) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
+            f"Conv backward, input size: ({batch_size}, {IC}, {H}, {W}), filter size ({OC}, {IC}, {FHW}, {FHW}) \
+                BW: {(batch_size * H * W * IC + FHW * FHW * IC * OC + batch_size * H * W * OC) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
         )
 
 
@@ -179,6 +179,35 @@ def benchmark_tril(batch_size, M, N, diag, iters, warmup_iters, backward):
         logging.info(
             f"Index forward, tensor size: ({batch_size}, {M}, {N}),\
                 BW: unknown, Time: {time_per_iter * 1.0e6:.0f}us"
+        )
+
+
+def benchmark_bn(batch_size, H, W, OC, iters, warmup_iters, backward):
+    out_feature = torch.randn(batch_size, OC, H, W, requires_grad=True).cuda()
+    bn = torch.nn.BatchNorm2d(OC).cuda()
+
+    if not backward:
+        time_per_iter = benchmark_torch_function(
+            iters,
+            warmup_iters,
+            bn,
+            out_feature
+        )
+        logging.info(
+            f"BN forward, tensor size: ({batch_size}, {OC}, {H}, {W}),\
+                BW: {batch_size * H * W * OC * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
+        )
+    else:
+        output = bn(out_feature)
+        time_per_iter = benchmark_torch_function(
+            iters,
+            warmup_iters,
+            output.mean().backward,
+            retain_graph=True,
+        )
+        logging.info(
+            f"BN forward, tensor size: ({batch_size}, {OC}, {H}, {W}),\
+                BW: {batch_size * H * W * OC * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
         )
 
 
@@ -714,6 +743,16 @@ def cli(
             m,
             n,
             diag,
+            iters,
+            warmup_iters,
+            backward,
+        )
+    elif op_type == "bn":
+        benchmark_bn(
+            batch_size,
+            h,
+            w,
+            oc,
             iters,
             warmup_iters,
             backward,
