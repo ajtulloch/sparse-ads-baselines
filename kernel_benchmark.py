@@ -206,7 +206,39 @@ def benchmark_bn(batch_size, H, W, OC, iters, warmup_iters, backward):
             retain_graph=True,
         )
         logging.info(
-            f"BN forward, tensor size: ({batch_size}, {OC}, {H}, {W}),\
+            f"BN backward, tensor size: ({batch_size}, {OC}, {H}, {W}),\
+                BW: {batch_size * H * W * OC * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
+        )
+
+
+def benchmark_pool(batch_size, H, W, OC, stride, dilation, FHW, is_maxpool, iters, warmup_iters, backward):
+    out_feature = torch.randn(batch_size, OC, H, W, requires_grad=True).cuda()
+    if is_maxpool:
+        pool = torch.nn.MaxPool2d(kernel_size=FHW, stride=stride, dilation=dilation).cuda()
+    else: # Avg pool
+        pool = torch.nn.AvgPool2d(kernel_size=FHW, stride=stride).cuda()
+
+    if not backward:
+        time_per_iter = benchmark_torch_function(
+            iters,
+            warmup_iters,
+            pool,
+            out_feature
+        )
+        logging.info(
+            f"Pool forward, tensor size: ({batch_size}, {OC}, {H}, {W}),\
+                BW: {batch_size * H * W * OC * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
+        )
+    else:
+        output = pool(out_feature)
+        time_per_iter = benchmark_torch_function(
+            iters,
+            warmup_iters,
+            output.mean().backward,
+            retain_graph=True,
+        )
+        logging.info(
+            f"Pool backward, tensor size: ({batch_size}, {OC}, {H}, {W}),\
                 BW: {batch_size * H * W * OC * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
         )
 
@@ -613,7 +645,7 @@ def benchmark_embedding_lookup(B, E, T, L, D, BT_block_size, iters, warmup_iters
 @click.option("--K", default=512)
 @click.option("--trans-type", default=0)
 @click.option("--diag", default=0)
-# Conv
+# Conv and pooling and BN
 @click.option("--H", default=64)
 @click.option("--W", default=64)
 @click.option("--IC", default=64)
@@ -622,6 +654,7 @@ def benchmark_embedding_lookup(B, E, T, L, D, BT_block_size, iters, warmup_iters
 @click.option("--dilation", default=1)
 @click.option("--FHW", default=3)
 @click.option("--is-dw", is_flag=True, default=False)
+@click.option("--is-maxpool", is_flag=True, default=False)
 def cli(
     op_type,
     iters,
@@ -650,7 +683,8 @@ def cli(
     stride,
     dilation,
     fhw,
-    is_dw
+    is_dw,
+    is_maxpool
 ):
     if op_type == "embedding_lookup":
         benchmark_embedding_lookup(
@@ -753,6 +787,20 @@ def cli(
             h,
             w,
             oc,
+            iters,
+            warmup_iters,
+            backward,
+        )
+    elif op_type == "pool":
+        benchmark_pool(
+            batch_size,
+            h,
+            w,
+            oc,
+            stride,
+            dilation,
+            fhw,
+            is_maxpool,
             iters,
             warmup_iters,
             backward,
