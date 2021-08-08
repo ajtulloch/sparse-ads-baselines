@@ -35,9 +35,12 @@ def benchmark_torch_function(iters, warmup_iters, f, *args, **kwargs):
     return total_time / iters
 
 
-def benchmark_conv(batch_size, H, W, IC, OC, stride, dilation, FHW, is_dw, iters, warmup_iters, backward):
-    input_feature = torch.randn(batch_size, IC, H, W).cuda()
-    conv = torch.nn.Conv2d(IC, OC, FHW, stride=stride, dilation=dilation, groups=(IC if is_dw else 1)).cuda()
+def benchmark_conv(batch_size, H, W, IC, OC, stride, dilation, FH, FW, is_dw, iters, warmup_iters, backward):
+    input_feature = torch.randn(batch_size, IC, H, W, requires_grad=True).cuda()
+    padding = []
+    for f in [FH, FW]:
+        padding.append((f - 1) // 2) # Only consider SAME with dilation = 1 for now
+    conv = torch.nn.Conv2d(IC, OC, (FH, FW), stride=stride, dilation=dilation, padding=padding, groups=(IC if is_dw else 1)).cuda()
 
     if not backward:
         time_per_iter = benchmark_torch_function(
@@ -47,19 +50,20 @@ def benchmark_conv(batch_size, H, W, IC, OC, stride, dilation, FHW, is_dw, iters
             input_feature
         )
         logging.info(
-            f"Conv, input size: ({batch_size}, {IC}, {H}, {W}), filter size ({OC}, {IC}, {FHW}, {FHW}) \
-                BW: {(batch_size * H * W * IC + FHW * FHW * IC * OC + batch_size * H * W * OC) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
+            f"Conv, input size: ({batch_size}, {IC}, {H}, {W}), filter size ({OC}, {IC}, {FH}, {FW}) \
+                BW: {(batch_size * H * W * IC + FH * FW * IC * OC + batch_size * H * W * OC) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
         )
     else:
+        out = conv(input_feature)
         time_per_iter = benchmark_torch_function(
             iters,
             warmup_iters,
-            conv.mean().backward,
+            out.mean().backward,
             retain_graph=True
         )
         logging.info(
-            f"Conv backward, input size: ({batch_size}, {IC}, {H}, {W}), filter size ({OC}, {IC}, {FHW}, {FHW}) \
-                BW: {(batch_size * H * W * IC + FHW * FHW * IC * OC + batch_size * H * W * OC) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
+            f"Conv backward, input size: ({batch_size}, {IC}, {H}, {W}), filter size ({OC}, {IC}, {FH}, {FW}) \
+                BW: {(batch_size * H * W * IC + FH * FW * IC * OC + batch_size * H * W * OC) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
         )
 
 
@@ -207,38 +211,6 @@ def benchmark_bn(batch_size, H, W, OC, iters, warmup_iters, backward):
         )
         logging.info(
             f"BN backward, tensor size: ({batch_size}, {OC}, {H}, {W}),\
-                BW: {batch_size * H * W * OC * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
-        )
-
-
-def benchmark_pool(batch_size, H, W, OC, stride, dilation, FHW, is_maxpool, iters, warmup_iters, backward):
-    out_feature = torch.randn(batch_size, OC, H, W, requires_grad=True).cuda()
-    if is_maxpool:
-        pool = torch.nn.MaxPool2d(kernel_size=FHW, stride=stride, dilation=dilation).cuda()
-    else: # Avg pool
-        pool = torch.nn.AvgPool2d(kernel_size=FHW, stride=stride).cuda()
-
-    if not backward:
-        time_per_iter = benchmark_torch_function(
-            iters,
-            warmup_iters,
-            pool,
-            out_feature
-        )
-        logging.info(
-            f"Pool forward, tensor size: ({batch_size}, {OC}, {H}, {W}),\
-                BW: {batch_size * H * W * OC * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
-        )
-    else:
-        output = pool(out_feature)
-        time_per_iter = benchmark_torch_function(
-            iters,
-            warmup_iters,
-            output.mean().backward,
-            retain_graph=True,
-        )
-        logging.info(
-            f"Pool backward, tensor size: ({batch_size}, {OC}, {H}, {W}),\
                 BW: {batch_size * H * W * OC * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
         )
 
@@ -645,16 +617,16 @@ def benchmark_embedding_lookup(B, E, T, L, D, BT_block_size, iters, warmup_iters
 @click.option("--K", default=512)
 @click.option("--trans-type", default=0)
 @click.option("--diag", default=0)
-# Conv and pooling and BN
+# Conv and BN
 @click.option("--H", default=64)
 @click.option("--W", default=64)
 @click.option("--IC", default=64)
 @click.option("--OC", default=64)
 @click.option("--stride", default=1)
 @click.option("--dilation", default=1)
-@click.option("--FHW", default=3)
+@click.option("--FH", default=3)
+@click.option("--FW", default=3)
 @click.option("--is-dw", is_flag=True, default=False)
-@click.option("--is-maxpool", is_flag=True, default=False)
 def cli(
     op_type,
     iters,
@@ -682,9 +654,9 @@ def cli(
     oc,
     stride,
     dilation,
-    fhw,
+    fh,
+    fw,
     is_dw,
-    is_maxpool
 ):
     if op_type == "embedding_lookup":
         benchmark_embedding_lookup(
@@ -731,7 +703,8 @@ def cli(
             oc,
             stride,
             dilation,
-            fhw,
+            fh,
+            fw,
             is_dw,
             iters,
             warmup_iters,
@@ -787,20 +760,6 @@ def cli(
             h,
             w,
             oc,
-            iters,
-            warmup_iters,
-            backward,
-        )
-    elif op_type == "pool":
-        benchmark_pool(
-            batch_size,
-            h,
-            w,
-            oc,
-            stride,
-            dilation,
-            fhw,
-            is_maxpool,
             iters,
             warmup_iters,
             backward,
