@@ -10,4 +10,6 @@ setup(name='table_batched_embeddings',
                   'table_batched_embeddings_cuda.cu'
               ])
       ],
-      cmdclass={'build_ext': BuildExtension})
+      cmdclass={'build_ext': BuildExtension},
+      data_files=[('', ['table_batched_embeddings_ops.py'])]
+)
