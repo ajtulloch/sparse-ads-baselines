@@ -1,6 +1,6 @@
 #include <ATen/ATen.h>
 #include <ATen/AccumulateType.h>
-#include <ATen/CUDAGeneratorImpl.h>
+#include <ATen/cuda/CUDAGeneratorImpl.h>
 #include <ATen/core/TensorAccessor.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/record_function.h>
