@@ -35,7 +35,7 @@ def benchmark_torch_function(iters, warmup_iters, f, *args, **kwargs):
     return total_time / iters
 
 
-def benchmark_conv(batch_size, H, W, IC, OC, stride, dilation, FH, FW, is_dw, iters, warmup_iters, backward):
+def benchmark_conv2d(batch_size, H, W, IC, OC, stride, dilation, FH, FW, is_dw, iters, warmup_iters, backward):
     input_feature = torch.randn(batch_size, IC, H, W, requires_grad=True).cuda()
     padding = []
     for f in [FH, FW]:
@@ -50,7 +50,7 @@ def benchmark_conv(batch_size, H, W, IC, OC, stride, dilation, FH, FW, is_dw, it
             input_feature
         )
         logging.info(
-            f"Conv, input size: ({batch_size}, {IC}, {H}, {W}), filter size ({OC}, {IC}, {FH}, {FW}) \
+            f"Conv2d, input size: ({batch_size}, {IC}, {H}, {W}), filter size ({OC}, {IC}, {FH}, {FW}) \
                 BW: {(batch_size * H * W * IC + FH * FW * IC * OC + batch_size * H * W * OC) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
         )
     else:
@@ -62,8 +62,38 @@ def benchmark_conv(batch_size, H, W, IC, OC, stride, dilation, FH, FW, is_dw, it
             retain_graph=True
         )
         logging.info(
-            f"Conv backward, input size: ({batch_size}, {IC}, {H}, {W}), filter size ({OC}, {IC}, {FH}, {FW}) \
+            f"Conv2d backward, input size: ({batch_size}, {IC}, {H}, {W}), filter size ({OC}, {IC}, {FH}, {FW}) \
                 BW: {(batch_size * H * W * IC + FH * FW * IC * OC + batch_size * H * W * OC) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
+        )
+
+
+# For parallel multi-head mm
+def benchmark_conv1d(batch_size, L, IC, OC, groups, iters, warmup_iters, backward):
+    input_feature = torch.randn(batch_size, IC * groups, L, requires_grad=True).cuda()
+    conv = torch.nn.Conv1d(IC * groups, OC * groups, kernel_size=1, groups=groups).cuda()
+
+    if not backward:
+        time_per_iter = benchmark_torch_function(
+            iters,
+            warmup_iters,
+            conv,
+            input_feature
+        )
+        logging.info(
+            f"Conv1d, input size: ({batch_size}, {IC * groups}, {L}), filter size ({IC * groups}, {OC * groups}) \
+                BW: {(batch_size * IC * L + IC * OC * groups + batch_size * OC * L * groups) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
+        )
+    else:
+        out = conv(input_feature)
+        time_per_iter = benchmark_torch_function(
+            iters,
+            warmup_iters,
+            out.mean().backward,
+            retain_graph=True
+        )
+        logging.info(
+            f"Conv1d backward, ({batch_size}, {IC * groups}, {L}), filter size ({IC * groups}, {OC * groups}) \
+                BW: {(batch_size * IC * L + IC * OC * groups + batch_size * OC * L * groups) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
         )
 
 
@@ -150,6 +180,7 @@ def benchmark_fc(batch_size, M, N, K, iters, warmup_iters, backward):
                 f"BmmBackward, tensor A size: ({batch_size}, {M}, {K}), tensor B size: ({batch_size}, {K}, {N}),\
                     BW: {batch_size * (M * K + N * K + M * N) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
             )
+
 
 def benchmark_tril(batch_size, M, N, diag, iters, warmup_iters, backward):
     assert M == N, "Input tensor should be square!"
@@ -617,16 +648,20 @@ def benchmark_embedding_lookup(B, E, T, L, D, BT_block_size, iters, warmup_iters
 @click.option("--K", default=512)
 @click.option("--trans-type", default=0)
 @click.option("--diag", default=0)
-# Conv and BN
-@click.option("--H", default=64)
-@click.option("--W", default=64)
+# Convs
 @click.option("--IC", default=64)
 @click.option("--OC", default=64)
+# Conv2d and BN
+@click.option("--H", default=64)
+@click.option("--W", default=64)
 @click.option("--stride", default=1)
 @click.option("--dilation", default=1)
 @click.option("--FH", default=3)
 @click.option("--FW", default=3)
 @click.option("--is-dw", is_flag=True, default=False)
+# Conv1d
+@click.option("--L", default=64)
+@click.option("--groups", default=16)
 def cli(
     op_type,
     iters,
@@ -648,15 +683,17 @@ def cli(
     k,
     trans_type,
     diag,
-    h,
-    w,
     ic,
     oc,
+    h,
+    w,
     stride,
     dilation,
     fh,
     fw,
     is_dw,
+    l,
+    groups,
 ):
     if op_type == "embedding_lookup":
         benchmark_embedding_lookup(
@@ -694,8 +731,8 @@ def cli(
             warmup_iters,
             backward,
         )
-    elif op_type == "conv":
-        benchmark_conv(
+    elif op_type == "conv2d":
+        benchmark_conv2d(
             batch_size,
             h,
             w,
@@ -706,6 +743,17 @@ def cli(
             fh,
             fw,
             is_dw,
+            iters,
+            warmup_iters,
+            backward,
+        )
+    elif op_type == "conv1d":
+        benchmark_conv1d(
+            batch_size,
+            l,
+            ic,
+            oc,
+            groups,
             iters,
             warmup_iters,
             backward,
