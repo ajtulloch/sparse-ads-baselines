@@ -1,8 +1,16 @@
 import numpy as np
 import torch, logging, click, functools
 import table_batched_embeddings, table_batched_embeddings_ops
+from fbgemm_gpu.split_table_batched_embeddings_ops import (
+    ComputeDevice,
+    EmbeddingLocation,
+    OptimType,
+    SparseType,
+    SplitTableBatchedEmbeddingBagsCodegen,
+)
 logging.basicConfig(level=logging.DEBUG)
 np.random.seed(42)
+torch.manual_seed(42)
 
 def div_round_up(a, b):
     return int((a + b - 1) // b) * b
@@ -339,7 +347,9 @@ def benchmark_embedding_lookup(B, E, T, L, D, BT_block_size, iters, warmup_iters
             T,
             Es,
             D,
-            optimizer=table_batched_embeddings_ops.Optimizer.APPROX_ROWWISE_ADAGRAD,
+            optimizer=table_batched_embeddings_ops.Optimizer.SGD
+            if sgd
+            else table_batched_embeddings_ops.Optimizer.APPROX_ROWWISE_ADAGRAD,
             learning_rate=0.1,
             managed=table_batched_embeddings_ops.EmbeddingLocation.DEVICE
             if not managed
@@ -351,7 +361,9 @@ def benchmark_embedding_lookup(B, E, T, L, D, BT_block_size, iters, warmup_iters
         if not mixed
         else table_batched_embeddings_ops.MixedDimTableBatchedEmbeddingBags(
             [(Es, d) for d in mixed_D],
-            optimizer=table_batched_embeddings_ops.Optimizer.APPROX_ROWWISE_ADAGRAD,
+            optimizer=table_batched_embeddings_ops.Optimizer.SGD
+            if sgd
+            else table_batched_embeddings_ops.Optimizer.APPROX_ROWWISE_ADAGRAD,
             learning_rate=0.1,
             managed=table_batched_embeddings_ops.EmbeddingLocation.DEVICE
             if not managed
@@ -625,6 +637,75 @@ def benchmark_embedding_lookup(B, E, T, L, D, BT_block_size, iters, warmup_iters
             )
 
 
+# Following the fashion of the old benchmark. Should probably change to the style of FBGEMM's new benchmark 
+# for diverse indices distribution per requests.
+def benchmark_embedding_lookup_fbgemm(B, E, T, L, D, iters, warmup_iters, backward, sgd, fp16, managed):
+    assert torch.cuda.is_available(), "GPU not found!"
+
+    Es = [int(x) for x in E.split('-')]
+    if len(Es) == 1:
+        Es = Es * T
+    assert len(Es) == T
+
+    idxs = []
+    for x in range(T):
+        idxs.append(torch.randint(low=0, high=Es[x] - 1, size=(B, L)).int().cuda())
+    merged_indices = torch.stack(idxs, dim=0)
+
+    (indices, offsets) = get_table_batched_offsets_from_dense(merged_indices)
+
+    assert indices.shape[0] == B * T * L
+    assert all(
+        l == L for l in (offsets[1:] - offsets[:-1]).detach().cpu().numpy().tolist()
+    )
+
+    emb = SplitTableBatchedEmbeddingBagsCodegen(
+        [
+            (
+                e,
+                D,
+                EmbeddingLocation.MANAGED if managed else EmbeddingLocation.DEVICE,
+                ComputeDevice.CUDA
+            )
+            for e in Es
+        ],
+        optimizer=OptimType.EXACT_SGD if sgd else OptimType.EXACT_ROWWISE_ADAGRAD,
+        learning_rate=0.1,
+        eps=0.1,
+        weights_precision=SparseType.FP16 if fp16 else SparseType.FP32,
+        stochastic_rounding=False,
+        output_dtype=SparseType.FP32,
+    ).to(torch.cuda.current_device())
+
+    if not backward:
+        time_per_iter = benchmark_torch_function(
+            iters,
+            warmup_iters,
+            emb.forward,
+            indices,
+            offsets
+        )
+        logging.info(
+            f"Embedding Lookup Forward (FBGEMM), B: {B}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {(2 if fp16 else 4) * B * T * L * D / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
+        )
+
+    else: # backward
+        output = emb.forward(indices.long(), offsets.long())
+        grad_output = torch.randn_like(output).cuda()
+        emb_backward = output.backward
+        time_per_iter = benchmark_torch_function(
+            iters,
+            warmup_iters,
+            emb_backward,
+            grad_output,
+            retain_graph=True
+        )
+
+        logging.info(
+            f"Embedding Lookup Backward-SGD (FBGEMM), B: {B}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {2 * (2 if fp16 else 4) * B * T * L * D / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
+        )
+
+
 @click.command()
 @click.option("--op-type", default="embedding_lookup")
 @click.option("--iters", default=100)
@@ -642,6 +723,7 @@ def benchmark_embedding_lookup(B, E, T, L, D, BT_block_size, iters, warmup_iters
 @click.option("--fp16", is_flag=True, default=False)
 @click.option("--managed", is_flag=True, default=False)
 @click.option("--mixed", is_flag=True, default=False)
+@click.option("--fbgemm", is_flag=True, default=False)
 # GEMM and transpose tril and more
 @click.option("--M", default=512)
 @click.option("--N", default=512)
@@ -678,6 +760,7 @@ def cli(
     fp16,
     managed,
     mixed,
+    fbgemm,
     m,
     n,
     k,
@@ -696,22 +779,37 @@ def cli(
     groups,
 ):
     if op_type == "embedding_lookup":
-        benchmark_embedding_lookup(
-            batch_size,
-            num_embeddings,
-            num_tables,
-            bag_size,
-            embedding_dim,
-            rows_per_block,
-            iters,
-            warmup_iters,
-            backward,
-            shmem,
-            sgd,
-            fp16,
-            managed,
-            mixed,
-        )
+        if fbgemm:
+            benchmark_embedding_lookup_fbgemm(
+                batch_size,
+                num_embeddings,
+                num_tables,
+                bag_size,
+                embedding_dim,
+                iters,
+                warmup_iters,
+                backward,
+                sgd,
+                fp16,
+                managed,
+            )
+        else:
+            benchmark_embedding_lookup(
+                batch_size,
+                num_embeddings,
+                num_tables,
+                bag_size,
+                embedding_dim,
+                rows_per_block,
+                iters,
+                warmup_iters,
+                backward,
+                shmem,
+                sgd,
+                fp16,
+                managed,
+                mixed,
+            )
     elif op_type == "fully_connected":
         benchmark_fc(
             batch_size,
