@@ -639,7 +639,7 @@ def benchmark_embedding_lookup(B, E, T, L, D, BT_block_size, iters, warmup_iters
 
 # Following the fashion of the old benchmark. Should probably change to the style of FBGEMM's new benchmark 
 # for diverse indices distribution per requests.
-def benchmark_embedding_lookup_fbgemm(B, E, T, L, D, iters, warmup_iters, backward, sgd, fp16, managed):
+def benchmark_embedding_lookup_fbgemm(B, E, T, L, D, iters, warmup_iters, backward, sgd, fp16, managed, caching):
     assert torch.cuda.is_available(), "GPU not found!"
 
     Es = [int(x) for x in E.split('-')]
@@ -659,12 +659,17 @@ def benchmark_embedding_lookup_fbgemm(B, E, T, L, D, iters, warmup_iters, backwa
         l == L for l in (offsets[1:] - offsets[:-1]).detach().cpu().numpy().tolist()
     )
 
+    placement = EmbeddingLocation.DEVICE
+    if caching:
+        placement = EmbeddingLocation.MANAGED_CACHING
+    elif managed:
+        placement = EmbeddingLocation.MANAGED
     emb = SplitTableBatchedEmbeddingBagsCodegen(
         [
             (
                 e,
                 D,
-                EmbeddingLocation.MANAGED if managed else EmbeddingLocation.DEVICE,
+                placement,
                 ComputeDevice.CUDA
             )
             for e in Es
@@ -724,6 +729,7 @@ def benchmark_embedding_lookup_fbgemm(B, E, T, L, D, iters, warmup_iters, backwa
 @click.option("--managed", is_flag=True, default=False)
 @click.option("--mixed", is_flag=True, default=False)
 @click.option("--fbgemm", is_flag=True, default=False)
+@click.option("--caching", is_flag=True, default=False)
 # GEMM and transpose tril and more
 @click.option("--M", default=512)
 @click.option("--N", default=512)
@@ -761,6 +767,7 @@ def cli(
     managed,
     mixed,
     fbgemm,
+    caching,
     m,
     n,
     k,
@@ -792,6 +799,7 @@ def cli(
                 sgd,
                 fp16,
                 managed,
+                caching,
             )
         else:
             benchmark_embedding_lookup(
