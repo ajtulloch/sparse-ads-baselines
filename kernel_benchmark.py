@@ -20,10 +20,69 @@ def get_table_batched_offsets_from_dense(merged_indices):
     (T, B, L) = merged_indices.size()
     lengths = np.ones((T, B)) * L
     flat_lengths = lengths.flatten()
-    return (
-        merged_indices.int().contiguous().view(-1).cuda(),
-        torch.tensor(([0] + np.cumsum(flat_lengths).tolist())).int().cuda(),
+    indices = merged_indices.contiguous().view(-1).long()
+    offsets = torch.tensor(([0] + np.cumsum(flat_lengths).tolist())).long()
+
+    assert indices.shape[0] == B * T * L
+    assert all(
+        l == L for l in (offsets[1:] - offsets[:-1]).numpy().tolist()
     )
+    return (indices.cuda(), offsets.cuda())
+
+
+def generate_emb_data(B, Es, T, Ls):
+    idxs = []
+    for i in range(T):
+        idxs.append(torch.randint(low=0, high=Es[i] - 1, size=(B, Ls[i])).int().cuda())
+    merged_indices = torch.stack(idxs, dim=0)
+
+    (indices, offsets) = get_table_batched_offsets_from_dense(merged_indices)
+    return indices, offsets
+
+
+def get_emb_data_from_dataset(dataset, B, TIDs):
+    # e.g. (dlrm_datasets) offsets: [856 * 65536, 1], lengths: [856, 65536]
+    indices, offsets, lengths = torch.load(dataset)
+    _, total_batch_size = lengths.shape # L per table per batch
+
+    lS_indices, lS_offsets, Es, Ls = [], [], [], []
+
+    for t in TIDs:
+        start = t * total_batch_size
+        end = (t + 1) * total_batch_size + 1
+        table_offsets = offsets[start:end]
+        table_indices = indices[table_offsets[0]:table_offsets[-1]] # length = total number of lookups
+        table_offsets = table_offsets - offsets[start] # length = total_batch_size
+
+        # # All non-zero lookup batches
+        # Ls_nonzero = torch.nonzero(lengths[t])
+
+        # # B batches that have non-zero lookups
+        # b_idx = np.random.choice(len(Ls_nonzero), B, replace=False)
+        # Ls = lengths[t][Ls_nonzero[b_idx]]
+
+        b_idx = np.sort(np.random.choice(total_batch_size, B, replace=False))
+
+        ind = []
+        os = []
+        o = 0
+        for x, L in zip(table_offsets[b_idx], lengths[t][b_idx]):
+            ind.append(table_indices[x:(x+L)])
+            os.append(o)
+            o += L.item()
+        os.append(o)
+        lS_indices.append(torch.cat(ind, dim=0).long())
+        lS_offsets.append(torch.tensor(os))
+
+        E = table_indices.max().int().item() + 1 if len(table_indices) > 0 else 1
+        Es.append(max(100, E)) # If less than 100 rows, make it 100
+        Ls.append(sum(lengths[t][b_idx]).item() / B) # Average L per table
+
+    args_indices = torch.cat([x.view(-1) for x in lS_indices], dim=0).int() # Concatenated indices
+    E_offsets = [0] + np.cumsum([x.view(-1).shape[0] for x in lS_indices]).tolist() # Cumsum of number-of-lookups per table
+    args_offsets = torch.cat([torch.tensor([0])] + [x[1:] + y for x, y in zip(lS_offsets, E_offsets[:-1])], dim=0).int() # Offset of each lookup when lookups are concatenated
+
+    return [args_indices.cuda(), args_offsets.cuda(), Es, Ls]
 
 
 def benchmark_torch_function(iters, warmup_iters, f, *args, **kwargs):
@@ -38,6 +97,31 @@ def benchmark_torch_function(iters, warmup_iters, f, *args, **kwargs):
         start_event.record()
         f(*args, **kwargs)
         end_event.record()
+        torch.cuda.synchronize()
+        total_time += start_event.elapsed_time(end_event) * 1.0e-3
+    return total_time / iters
+
+
+def benchmark_fbgemm(iters, warmup_iters, op, input_data, grads_tensor, fwbw, *args, **kwargs):
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    for idx in range(warmup_iters): # Warmup
+        indices, offsets = input_data[idx]
+        op(indices, offsets, *args, **kwargs)
+    torch.cuda.synchronize()
+    total_time = 0.0
+    for idx in range(warmup_iters, warmup_iters + iters):
+        indices, offsets = input_data[idx]
+        if fwbw == "fw":
+            start_event.record()
+            op(indices, offsets, *args, **kwargs)
+            end_event.record()
+        else: # bw
+            tmp = op(indices, offsets, *args, **kwargs)
+            torch.cuda.synchronize()
+            start_event.record()
+            tmp.backward(grads_tensor)
+            end_event.record()
         torch.cuda.synchronize()
         total_time += start_event.elapsed_time(end_event) * 1.0e-3
     return total_time / iters
@@ -335,6 +419,7 @@ def benchmark_embedding_lookup(B, E, T, L, D, BT_block_size, iters, warmup_iters
     if len(Es) == 1:
         Es = Es * T
     assert len(Es) == T
+    D = int(D)
 
     if mixed:
         mixed_D = [
@@ -420,17 +505,8 @@ def benchmark_embedding_lookup(B, E, T, L, D, BT_block_size, iters, warmup_iters
 
         return z
 
-    idxs = []
-    for x in range(T):
-        idxs.append(torch.randint(low=0, high=Es[x] - 1, size=(B, L)).int().cuda())
-    merged_indices = torch.stack(idxs, dim=0)
+    (indices, offsets) = generate_emb_data(B, Es, T, L)
 
-    (indices, offsets) = get_table_batched_offsets_from_dense(merged_indices)
-
-    assert indices.shape[0] == B * T * L
-    assert all(
-        l == L for l in (offsets[1:] - offsets[:-1]).detach().cpu().numpy().tolist()
-    )
     per_sample_weights = None
     stochastic = False # TODO: Fix this
     exact = 1
@@ -485,7 +561,7 @@ def benchmark_embedding_lookup(B, E, T, L, D, BT_block_size, iters, warmup_iters
             False,
         )
     )
-    torch.testing.assert_allclose(y, y0)
+    torch.testing.assert_close(y, y0)
 
     if not backward:
         time_per_iter = (
@@ -639,25 +715,30 @@ def benchmark_embedding_lookup(B, E, T, L, D, BT_block_size, iters, warmup_iters
 
 # Following the fashion of the old benchmark. Should probably change to the style of FBGEMM's new benchmark 
 # for diverse indices distribution per requests.
-def benchmark_embedding_lookup_fbgemm(B, E, T, L, D, iters, warmup_iters, backward, sgd, fp16, managed, caching):
+def benchmark_embedding_lookup_fbgemm(B, E, T, L, D, iters, warmup_iters, backward, sgd, fp16, managed, caching, dataset):
     assert torch.cuda.is_available(), "GPU not found!"
+    assert not (L == 0 and dataset is None) # When L = 0 there should be dataset
 
-    Es = [int(x) for x in E.split('-')]
+    Es = [int(x) for x in E.split('-')] # Borrow E for TIDs for dataset benchmark
     if len(Es) == 1:
         Es = Es * T
     assert len(Es) == T
+    Ds = [int(x) for x in D.split('-')]
+    if len(Ds) == 1:
+        Ds = Ds * T
+    assert len(Ds) == T
 
-    idxs = []
-    for x in range(T):
-        idxs.append(torch.randint(low=0, high=Es[x] - 1, size=(B, L)).int().cuda())
-    merged_indices = torch.stack(idxs, dim=0)
-
-    (indices, offsets) = get_table_batched_offsets_from_dense(merged_indices)
-
-    assert indices.shape[0] == B * T * L
-    assert all(
-        l == L for l in (offsets[1:] - offsets[:-1]).detach().cpu().numpy().tolist()
-    )
+    data = []
+    if dataset is not None:
+        TIDs = Es
+        indices, offsets, Es, Ls = get_emb_data_from_dataset(dataset, B, TIDs)
+        data = [(indices, offsets)] * (warmup_iters + iters)
+    else:
+        for _ in range(warmup_iters + iters):
+            indices, offsets = generate_emb_data(B, Es, T, L)
+        data.append((indices, offsets))
+    grads_tensor = torch.randn(B, sum(Ds))
+    fwbw = "bw" if backward else "fw"
 
     placement = EmbeddingLocation.DEVICE
     if caching:
@@ -668,11 +749,11 @@ def benchmark_embedding_lookup_fbgemm(B, E, T, L, D, iters, warmup_iters, backwa
         [
             (
                 e,
-                D,
+                d,
                 placement,
                 ComputeDevice.CUDA
             )
-            for e in Es
+            for e, d in zip(Es, Ds)
         ],
         optimizer=OptimType.EXACT_SGD if sgd else OptimType.EXACT_ROWWISE_ADAGRAD,
         learning_rate=0.1,
@@ -682,32 +763,15 @@ def benchmark_embedding_lookup_fbgemm(B, E, T, L, D, iters, warmup_iters, backwa
         output_dtype=SparseType.FP32,
     ).to(torch.cuda.current_device())
 
+    time_per_iter = benchmark_fbgemm(iters, warmup_iters, emb, data, grads_tensor, fwbw)
+
     if not backward:
-        time_per_iter = benchmark_torch_function(
-            iters,
-            warmup_iters,
-            emb.forward,
-            indices,
-            offsets
-        )
         logging.info(
-            f"Embedding Lookup Forward (FBGEMM), B: {B}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {(2 if fp16 else 4) * B * T * L * D / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
+            f"Embedding Lookup Forward (FBGEMM), B: {B}, E: {'-'.join([str(e) for e in Es])}, T: {T}, D: {'-'.join([str(d) for d in Ds])}, L: {'-'.join([str(l) for l in Ls])}, Time: {time_per_iter * 1.0e6:.0f}us"
         )
-
     else: # backward
-        output = emb.forward(indices.long(), offsets.long())
-        grad_output = torch.randn_like(output).cuda()
-        emb_backward = output.backward
-        time_per_iter = benchmark_torch_function(
-            iters,
-            warmup_iters,
-            emb_backward,
-            grad_output,
-            retain_graph=True
-        )
-
         logging.info(
-            f"Embedding Lookup Backward-SGD (FBGEMM), B: {B}, E: {E}, T: {T}, D: {D}, L: {L}, BW: {2 * (2 if fp16 else 4) * B * T * L * D / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
+            f"Embedding Lookup Backward-SGD (FBGEMM), B: {B}, E: {'-'.join([str(e) for e in Es])}, T: {T}, D: {'-'.join([str(d) for d in Ds])}, L: {'-'.join([str(l) for l in Ls])}, Time: {time_per_iter * 1.0e6:.0f}us"
         )
 
 
@@ -721,7 +785,7 @@ def benchmark_embedding_lookup_fbgemm(B, E, T, L, D, iters, warmup_iters, backwa
 @click.option("--num-embeddings", default="1000") # str by default in case 'x-y-z'
 @click.option("--num-tables", default=64)
 @click.option("--bag-size", default=38)
-@click.option("--embedding-dim", default=32)
+@click.option("--embedding-dim", default="32")
 @click.option("--rows-per-block", default=32)
 @click.option("--shmem", is_flag=True, default=False)
 @click.option("--sgd", is_flag=True, default=False)
@@ -730,6 +794,7 @@ def benchmark_embedding_lookup_fbgemm(B, E, T, L, D, iters, warmup_iters, backwa
 @click.option("--mixed", is_flag=True, default=False)
 @click.option("--fbgemm", is_flag=True, default=False)
 @click.option("--caching", is_flag=True, default=False)
+@click.option("--dataset", default=None)
 # GEMM and transpose tril and more
 @click.option("--M", default=512)
 @click.option("--N", default=512)
@@ -768,6 +833,7 @@ def cli(
     mixed,
     fbgemm,
     caching,
+    dataset,
     m,
     n,
     k,
@@ -800,6 +866,7 @@ def cli(
                 fp16,
                 managed,
                 caching,
+                dataset,
             )
         else:
             benchmark_embedding_lookup(
@@ -924,3 +991,4 @@ def cli(
 
 if __name__ == "__main__":
     cli()
+
