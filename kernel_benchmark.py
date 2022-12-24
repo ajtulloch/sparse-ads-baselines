@@ -737,7 +737,7 @@ def benchmark_embedding_lookup_fbgemm(B, E, T, L, D, iters, warmup_iters, backwa
         for _ in range(warmup_iters + iters):
             indices, offsets = generate_emb_data(B, Es, T, L)
         data.append((indices, offsets))
-    grads_tensor = torch.randn(B, sum(Ds))
+    grads_tensor = torch.randn(B, sum(Ds)).cuda()
     fwbw = "bw" if backward else "fw"
 
     placement = EmbeddingLocation.DEVICE
