@@ -30,6 +30,25 @@ def get_table_batched_offsets_from_dense(merged_indices):
     return (indices.cuda(), offsets.cuda())
 
 
+def get_reuse_factor(indices):
+    _, indices_counts = torch.unique(indices, return_counts=True)
+    unique_counts, counts_counts = torch.unique(indices_counts, return_counts=True)
+    total_counts = counts_counts.sum().item()
+
+    if total_counts == 0:
+        bin_counts = [0.0 for _ in range(17)]
+    else:
+        start, end = 0, 1
+        bin_counts = []
+        for _ in range(16):
+            bin_counts.append(counts_counts[(unique_counts > start) & (unique_counts <= end)].sum().item())
+            start = end
+            end *= 2
+        bin_counts.append(counts_counts[unique_counts > start].sum().item())
+        bin_counts = [x/total_counts for x in bin_counts]
+    return bin_counts
+
+
 def generate_emb_data(B, Es, T, Ls):
     idxs = []
     for i in range(T):
@@ -37,15 +56,15 @@ def generate_emb_data(B, Es, T, Ls):
     merged_indices = torch.stack(idxs, dim=0)
 
     (indices, offsets) = get_table_batched_offsets_from_dense(merged_indices)
-    return indices, offsets
+    return indices, offsets, get_reuse_factor(indices)
 
 
-def get_emb_data_from_dataset(dataset, B, TIDs):
+def get_emb_data_from_dataset(dataset_path, B, TIDs):
     # e.g. (dlrm_datasets) offsets: [856 * 65536, 1], lengths: [856, 65536]
-    indices, offsets, lengths = torch.load(dataset)
+    indices, offsets, lengths = torch.load(dataset_path)
     _, total_batch_size = lengths.shape # L per table per batch
 
-    lS_indices, lS_offsets, Es, Ls = [], [], [], []
+    lS_indices, lS_offsets, lS_bin_counts, Es, Ls = [], [], [], [], []
 
     for t in TIDs:
         start = t * total_batch_size
@@ -71,8 +90,10 @@ def get_emb_data_from_dataset(dataset, B, TIDs):
             os.append(o)
             o += L.item()
         os.append(o)
-        lS_indices.append(torch.cat(ind, dim=0).long())
+        batch_indices = torch.cat(ind, dim=0).long()
+        lS_indices.append(batch_indices)
         lS_offsets.append(torch.tensor(os))
+        lS_bin_counts.append(get_reuse_factor(batch_indices))
 
         E = table_indices.max().int().item() + 1 if len(table_indices) > 0 else 1
         Es.append(max(100, E)) # If less than 100 rows, make it 100
@@ -82,7 +103,7 @@ def get_emb_data_from_dataset(dataset, B, TIDs):
     E_offsets = [0] + np.cumsum([x.view(-1).shape[0] for x in lS_indices]).tolist() # Cumsum of number-of-lookups per table
     args_offsets = torch.cat([torch.tensor([0])] + [x[1:] + y for x, y in zip(lS_offsets, E_offsets[:-1])], dim=0).int() # Offset of each lookup when lookups are concatenated
 
-    return [args_indices.cuda(), args_offsets.cuda(), Es, Ls]
+    return [args_indices.cuda(), args_offsets.cuda(), lS_bin_counts, Es, Ls]
 
 
 def benchmark_torch_function(iters, warmup_iters, f, *args, **kwargs):
@@ -731,11 +752,11 @@ def benchmark_embedding_lookup_fbgemm(B, E, T, L, D, iters, warmup_iters, backwa
     data = []
     if dataset is not None:
         TIDs = Es
-        indices, offsets, Es, Ls = get_emb_data_from_dataset(dataset, B, TIDs)
+        indices, offsets, reuse_factors, Es, Ls = get_emb_data_from_dataset(dataset, B, TIDs)
         data = [(indices, offsets)] * (warmup_iters + iters)
     else:
         for _ in range(warmup_iters + iters):
-            indices, offsets = generate_emb_data(B, Es, T, L)
+            indices, offsets, reuse_factors = generate_emb_data(B, Es, T, L)
         data.append((indices, offsets))
     grads_tensor = torch.randn(B, sum(Ds)).cuda()
     fwbw = "bw" if backward else "fw"
@@ -765,6 +786,9 @@ def benchmark_embedding_lookup_fbgemm(B, E, T, L, D, iters, warmup_iters, backwa
 
     time_per_iter = benchmark_fbgemm(iters, warmup_iters, emb, data, grads_tensor, fwbw)
 
+    logging.info(
+        "Reuse factors: {}".format('_'.join(['-'.join([f'{rf:.8f}' for rf in t_rf]) for t_rf in reuse_factors]))
+    )
     if not backward:
         logging.info(
             f"Embedding Lookup Forward (FBGEMM), B: {B}, E: {'-'.join([str(e) for e in Es])}, T: {T}, D: {'-'.join([str(d) for d in Ds])}, L: {'-'.join([str(l) for l in Ls])}, Time: {time_per_iter * 1.0e6:.0f}us"
