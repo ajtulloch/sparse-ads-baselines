@@ -20,8 +20,8 @@ def get_table_batched_offsets_from_dense(merged_indices):
     (T, B, L) = merged_indices.size()
     lengths = np.ones((T, B)) * L
     flat_lengths = lengths.flatten()
-    indices = merged_indices.contiguous().view(-1).long()
-    offsets = torch.tensor(([0] + np.cumsum(flat_lengths).tolist())).long()
+    indices = merged_indices.contiguous().view(-1).int()
+    offsets = torch.tensor(([0] + np.cumsum(flat_lengths).tolist())).int()
 
     assert indices.shape[0] == B * T * L
     assert all(
@@ -55,7 +55,7 @@ def generate_emb_data(B, Es, T, Ls):
         idxs.append(torch.randint(low=0, high=Es[i] - 1, size=(B, Ls[i])).int().cuda())
     merged_indices = torch.stack(idxs, dim=0)
 
-    (indices, offsets) = get_table_batched_offsets_from_dense(merged_indices)
+    indices, offsets = get_table_batched_offsets_from_dense(merged_indices)
     return indices, offsets, get_reuse_factor(indices)
 
 
@@ -440,6 +440,9 @@ def benchmark_embedding_lookup(B, E, T, L, D, BT_block_size, iters, warmup_iters
     if len(Es) == 1:
         Es = Es * T
     assert len(Es) == T
+    assert '-' not in L # Batched table embedding only support unique L for all tables.
+    L = int(L)
+    Ls = [L] * T
     D = int(D)
 
     if mixed:
@@ -526,7 +529,7 @@ def benchmark_embedding_lookup(B, E, T, L, D, BT_block_size, iters, warmup_iters
 
         return z
 
-    (indices, offsets) = generate_emb_data(B, Es, T, L)
+    indices, offsets, _ = generate_emb_data(B, Es, T, Ls)
 
     per_sample_weights = None
     stochastic = False # TODO: Fix this
@@ -808,7 +811,7 @@ def benchmark_embedding_lookup_fbgemm(B, E, T, L, D, iters, warmup_iters, backwa
 # Embedding lookup
 @click.option("--num-embeddings", default="1000") # str by default in case 'x-y-z'
 @click.option("--num-tables", default=64)
-@click.option("--bag-size", default=38)
+@click.option("--bag-size", default="38")
 @click.option("--embedding-dim", default="32")
 @click.option("--rows-per-block", default=32)
 @click.option("--shmem", is_flag=True, default=False)
