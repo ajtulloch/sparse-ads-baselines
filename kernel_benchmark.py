@@ -81,18 +81,9 @@ def get_emb_data_from_dataset(dataset_path, B, TIDs):
         # Ls = lengths[t][Ls_nonzero[b_idx]]
 
         b_idx = np.sort(np.random.choice(total_batch_size, B, replace=False))
-
-        ind = []
-        os = []
-        o = 0
-        for x, L in zip(table_offsets[b_idx], lengths[t][b_idx]):
-            ind.append(table_indices[x:(x+L)])
-            os.append(o)
-            o += L.item()
-        os.append(o)
-        batch_indices = torch.cat(ind, dim=0).long()
+        batch_indices = torch.cat([table_indices[x:(x+L)] for x, L in zip(table_offsets[b_idx], lengths[t][b_idx])], dim=0)
         lS_indices.append(batch_indices)
-        lS_offsets.append(torch.tensor(os))
+        lS_offsets.append(torch.cat([torch.tensor([0]), torch.cumsum(lengths[t][b_idx], dim=0)]))
         lS_bin_counts.append(get_reuse_factor(batch_indices))
 
         E = table_indices.max().int().item() + 1 if len(table_indices) > 0 else 1
