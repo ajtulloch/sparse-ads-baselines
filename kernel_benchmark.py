@@ -350,6 +350,35 @@ def benchmark_bn(batch_size, H, W, OC, iters, warmup_iters, backward):
         )
 
 
+def benchmark_ln(batch_size, H, W, OC, iters, warmup_iters, backward):
+    out_feature = torch.randn(batch_size, OC, H, W, requires_grad=True).cuda()
+    ln = torch.nn.LayerNorm([OC, H, W]).cuda()
+
+    if not backward:
+        time_per_iter = benchmark_torch_function(
+            iters,
+            warmup_iters,
+            ln,
+            out_feature
+        )
+        logging.info(
+            f"LN forward, tensor size: ({batch_size}, {OC}, {H}, {W}),\
+                BW: {batch_size * H * W * OC * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
+        )
+    else:
+        output = ln(out_feature)
+        time_per_iter = benchmark_torch_function(
+            iters,
+            warmup_iters,
+            output.mean().backward,
+            retain_graph=True,
+        )
+        logging.info(
+            f"LN backward, tensor size: ({batch_size}, {OC}, {H}, {W}),\
+                BW: {batch_size * H * W * OC * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
+        )
+
+
 def benchmark_concat(batch_size, M, N, K, iters, warmup_iters):
     A = torch.randn(batch_size, M, K).cuda()
     B = torch.randn(batch_size, N, K).cuda()
@@ -386,6 +415,7 @@ def benchmark_memcpy(batch_size, M, N, iters, warmup_iters):
 
 def benchmark_transpose(batch_size, M, N, trans_type, iters, warmup_iters):
     A = torch.randn(batch_size, M, N).cuda()
+
     if trans_type == 0:
         time_per_iter = benchmark_torch_function(
             iters,
@@ -411,19 +441,62 @@ def benchmark_transpose(batch_size, M, N, trans_type, iters, warmup_iters):
     )
 
 
-def benchmark_relu(batch_size, M, N, iters, warmup_iters):
+def benchmark_gelu(batch_size, M, N, iters, warmup_iters, backward):
     A = torch.randn(batch_size, M, N).cuda()
-    time_per_iter = benchmark_torch_function(
-        iters,
-        warmup_iters,
-        torch.relu,
-        A
-    )
+    gelu = torch.nn.GELU()
 
-    logging.info(
-        f"ReLU, size: ({batch_size}, {M}, {N}), \
-            BW: {(batch_size * M * N) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
-    )
+    if not backward:
+        time_per_iter = benchmark_torch_function(
+            iters,
+            warmup_iters,
+            gelu,
+            A
+        )
+        logging.info(
+            f"GeLU, size: ({batch_size}, {M}, {N}), \
+                BW: {(batch_size * M * N) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
+        )
+    else:
+        output = gelu(A)
+        time_per_iter = benchmark_torch_function(
+            iters,
+            warmup_iters,
+            output.mean().backward,
+            retain_graph=True,
+        )
+        logging.info(
+            f"GeLU backward, size: ({batch_size}, {M}, {N}), \
+                BW: {(batch_size * M * N) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
+        )
+
+
+def benchmark_dropout(batch_size, M, N, p, iters, warmup_iters, backward):
+    A = torch.randn(batch_size, M, N).cuda()
+    dropout = torch.nn.Dropout(p)
+
+    if not backward:
+        time_per_iter = benchmark_torch_function(
+            iters,
+            warmup_iters,
+            dropout,
+            A
+        )
+        logging.info(
+            f"Dropout, size: ({batch_size}, {M}, {N}), \
+                BW: {(batch_size * M * N) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
+        )
+    else:
+        output = dropout(A)
+        time_per_iter = benchmark_torch_function(
+            iters,
+            warmup_iters,
+            output.mean().backward,
+            retain_graph=True,
+        )
+        logging.info(
+            f"Dropout backward, size: ({batch_size}, {M}, {N}), \
+                BW: {(batch_size * M * N) * 4 / time_per_iter / 1.0e9: .2f}GB/s, Time: {time_per_iter * 1.0e6:.0f}us"
+        )
 
 
 def benchmark_embedding_lookup(B, E, T, L, D, BT_block_size, iters, warmup_iters, backward, shmem, sgd, fp16, managed, mixed):
@@ -813,7 +886,7 @@ def benchmark_embedding_lookup_fbgemm(B, E, T, L, D, iters, warmup_iters, backwa
 @click.option("--fbgemm", is_flag=True, default=False)
 @click.option("--caching", is_flag=True, default=False)
 @click.option("--dataset", default=None)
-# GEMM and transpose tril and more
+# GEMM and transpose and tril and more
 @click.option("--M", default=512)
 @click.option("--N", default=512)
 @click.option("--K", default=512)
@@ -833,6 +906,8 @@ def benchmark_embedding_lookup_fbgemm(B, E, T, L, D, iters, warmup_iters, backwa
 # Conv1d
 @click.option("--L", default=64)
 @click.option("--groups", default=16)
+# Dropout
+@click.option("--p", default=0.2)
 def cli(
     op_type,
     iters,
@@ -868,6 +943,7 @@ def cli(
     is_dw,
     l,
     groups,
+    p,
 ):
     if op_type == "embedding_lookup":
         if fbgemm:
@@ -967,7 +1043,7 @@ def cli(
             warmup_iters,
         )
     elif op_type == "transpose":
-            benchmark_transpose(
+        benchmark_transpose(
             batch_size,
             m,
             n,
@@ -975,13 +1051,24 @@ def cli(
             iters,
             warmup_iters,
         )
-    elif op_type == "relu":
-        benchmark_relu(
+    elif op_type == "gelu":
+        benchmark_gelu(
             batch_size,
             m,
             n,
             iters,
             warmup_iters,
+            backward,
+        )
+    elif op_type == "dropout":
+        benchmark_dropout(
+            batch_size,
+            m,
+            n,
+            p,
+            iters,
+            warmup_iters,
+            backward,
         )
     elif op_type == "tril":
         benchmark_tril(
@@ -995,6 +1082,16 @@ def cli(
         )
     elif op_type == "bn":
         benchmark_bn(
+            batch_size,
+            h,
+            w,
+            oc,
+            iters,
+            warmup_iters,
+            backward,
+        )
+    elif op_type == "ln":
+        benchmark_ln(
             batch_size,
             h,
             w,
