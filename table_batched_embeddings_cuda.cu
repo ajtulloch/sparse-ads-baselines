@@ -1,8 +1,10 @@
 #include <ATen/ATen.h>
 #include <ATen/AccumulateType.h>
-#include <ATen/CUDAGenerator.h>
+#include <ATen/cuda/CUDAGeneratorImpl.h>
 #include <ATen/core/TensorAccessor.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/record_function.h>
+#include <ATen/SequenceNumber.h>
 #include <c10/cuda/CUDAGuard.h>
 
 #include "cub/device/device_radix_sort.cuh"
@@ -15,6 +17,7 @@
 using namespace at;
 
 #define DEVICE_INLINE __device__ inline __attribute__((always_inline))
+#define __HALF2_TO_UI(var) *(reinterpret_cast<unsigned int *>(&(var)))
 
 namespace {
 
@@ -250,11 +253,96 @@ __global__ void batched_embedding_forward_kernel_1(
   }
 }
 
+template <typename scalar_t, bool shared_indices, typename F>
+__global__ void batched_embedding_forward_kernel_permuted(
+    // [\sum_t E_t][D]
+    const PackedTensorAccessor64<scalar_t, 2, RestrictPtrTraits> weights,
+    const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits>
+        table_offsets, // [T]
+    const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits>
+        indices, // [N = \sum_{b,t} L_{b,t} total indices, i.e. flattened
+                 // [T][B][L]
+    const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits>
+        offsets, // [T x B + 1]
+    const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits>
+        permuted_offsets_indices, // [T x B]
+    // offsets = cumsum([0] + lengths.contiguous()), where lengths L is [T][.
+    PackedTensorAccessor32<scalar_t, 3, RestrictPtrTraits>
+        output, // [B][T][D],
+    int32_t L_max,
+    F f) {
+
+  extern __shared__ int32_t shmem_indices[];
+
+  const int32_t B = output.size(0);
+  const int32_t T = output.size(1);
+  const int32_t D = output.size(2);
+
+  int32_t b_t = permuted_offsets_indices[blockIdx.x * blockDim.y + threadIdx.y]; // Permuted warp id
+  int32_t t = b_t / B;
+  int32_t b = b_t % B;
+
+  const int32_t table_offset = table_offsets[t];
+  const int32_t indices_start = offsets[b_t];
+  const int32_t indices_end = offsets[b_t + 1];
+  int32_t L = indices_end - indices_start;
+
+  if (shared_indices) {
+    int32_t shmem_offset = threadIdx.y * L_max;
+    for (int32_t i = threadIdx.x; i < L; i += blockDim.x) {
+      shmem_indices[shmem_offset + i] = __ldg(&indices[indices_start + i]);
+    }
+    __syncthreads();
+    for (int32_t d = threadIdx.x; d * 4 < D; d += blockDim.x) {
+      Vec4T<scalar_t> sum;
+      for (int32_t l = 0; l < L; ++l) {
+        auto idx = shmem_indices[shmem_offset + l];
+        Vec4T<scalar_t> weight((&weights[table_offset + idx][0]) + d * 4);
+        f.accumulate(sum, weight, indices_start + l);
+      }
+      sum.store((&output[b][t][0]) + d * 4);
+    }
+  } else {
+    for (int32_t d = threadIdx.x; d * 4 < D; d += blockDim.x) {
+      Vec4T<scalar_t> sum;
+      for (int32_t l = 0; l < L; ++l) {
+        auto idx = __ldg(&indices[indices_start + l]);
+        Vec4T<scalar_t> weight((&weights[table_offset + idx][0]) + d * 4);
+        f.accumulate(sum, weight, indices_start + l);
+      }
+      sum.store((&output[b][t][0]) + d * 4);
+    }
+  }
+}
+
+__global__ void get_permute(
+    const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits> offsets,
+    PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits> permuted_offsets_indices
+  ) {
+
+  const int32_t B = permuted_offsets_indices.size(1);
+  const int32_t T = permuted_offsets_indices.size(0);
+
+  int32_t b_t = blockIdx.x * blockDim.y + threadIdx.y;
+
+  if (threadIdx.x == 0) {
+    permuted_offsets_indices[b_t] = b_t;
+  }
+}
+
 Tensor batched_embedding_forward_cuda(Tensor weights, Tensor table_offsets,
                                       Tensor indices, Tensor offsets,
                                       c10::optional<Tensor> indice_weights,
                                       int64_t L_max, int64_t BT_block_size,
                                       bool shmem) {
+  auto iv_inputs = std::vector<c10::IValue>();
+  iv_inputs.push_back(c10::IValue(weights));
+  iv_inputs.push_back(c10::IValue(table_offsets));
+  iv_inputs.push_back(c10::IValue(indices));
+  iv_inputs.push_back(c10::IValue(offsets));
+  iv_inputs.push_back(c10::IValue(indice_weights));
+  RECORD_FUNCTION("batched_embedding_forward_cuda", iv_inputs, at::sequence_number::peek());
+
   at::cuda::OptionalCUDAGuard device_guard;
   device_guard.set_index(weights.get_device());
 
@@ -281,6 +369,82 @@ Tensor batched_embedding_forward_cuda(Tensor weights, Tensor table_offsets,
       weights.packed_accessor64<scalar_t, 2, RestrictPtrTraits>(),             \
       table_offsets.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),        \
       indices.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),              \
+      offsets.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),              \
+      output.packed_accessor32<scalar_t, 3, RestrictPtrTraits>(),              \
+      static_cast<int32_t>(L_max), (functor))
+
+  auto output = empty({B, T, D}, weights.options());
+  AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+      weights.type(), "batched_embedding_forward_kernel", ([&] {
+        if (shmem) {
+          if (indice_weights) {
+            X(true, BT_block_size * L_max * sizeof(int32_t),
+              WeightedForward<scalar_t>(
+                  indice_weights
+                      ->packed_accessor32<scalar_t, 1, RestrictPtrTraits>()));
+          } else {
+            X(true, BT_block_size * L_max * sizeof(int32_t),
+              UnweightedForward<scalar_t>());
+          }
+        } else {
+          if (indice_weights) {
+            X(false, 0,
+              WeightedForward<scalar_t>(
+                  indice_weights
+                      ->packed_accessor32<scalar_t, 1, RestrictPtrTraits>()));
+          } else {
+            X(false, 0, UnweightedForward<scalar_t>());
+          }
+        }
+      }));
+
+#undef X
+  AT_CUDA_CHECK(cudaGetLastError());
+  return output;
+}
+
+Tensor batched_embedding_forward_cuda_permuted( Tensor weights, Tensor table_offsets,
+                                                Tensor indices, Tensor offsets,
+                                                Tensor permuted_offsets_indices,
+                                                c10::optional<Tensor> indice_weights,
+                                                int64_t L_max, int64_t BT_block_size,
+                                                bool shmem) {
+  at::cuda::OptionalCUDAGuard device_guard;
+  device_guard.set_index(weights.get_device());
+
+  const auto T = table_offsets.size(0);
+  AT_ASSERT(T > 0);
+  const auto D = weights.size(1);
+  AT_ASSERT(D > 0);
+  // offsets = [B x T  + 1]
+  const auto B = (offsets.size(0) - 1) / T;
+  AT_ASSERT(B > 0);
+  AT_ASSERT(BT_block_size != 0);
+  if ((B * T) % BT_block_size != 0) {
+    BT_block_size = 1;
+  }
+  AT_ASSERT((B * T) % BT_block_size == 0);
+  AT_ASSERT(D % 4 == 0);
+  const dim3 threads(std::min(D / 4, kMaxThreads / BT_block_size),
+                     BT_block_size);
+  const dim3 blocks((B * T) / BT_block_size);
+
+  // auto permuted_offsets_indices = empty({T, B}, weights.options());
+  // AT_DISPATCH_INDEX_TYPES(
+  //   indices.type(), "get_permute", ([&] {
+  //     get_permute<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+  //       offsets.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
+  //       permuted_offsets_indices.packed_accessor32<int32_t, 1, RestrictPtrTraits>()
+  //     );
+  //   }));
+
+#define X(shmem_param, shmem_size, functor)                                    \
+  batched_embedding_forward_kernel_permuted<scalar_t, (shmem_param)><<<        \
+      blocks, threads, (shmem_size), at::cuda::getCurrentCUDAStream()>>>(      \
+      weights.packed_accessor64<scalar_t, 2, RestrictPtrTraits>(),             \
+      table_offsets.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),        \
+      indices.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),              \
+      permuted_offsets_indices.packed_accessor32<int32_t, 1, RestrictPtrTraits>(), \
       offsets.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),              \
       output.packed_accessor32<scalar_t, 3, RestrictPtrTraits>(),              \
       static_cast<int32_t>(L_max), (functor))
@@ -385,6 +549,14 @@ void batched_embedding_backward_sgd_cuda(Tensor grad_output, Tensor weights,
                                          Tensor offsets, float learning_rate,
                                          int64_t L_max, int64_t BT_block_size,
                                          bool shmem) {
+  auto iv_inputs = std::vector<c10::IValue>();
+  iv_inputs.push_back(c10::IValue(grad_output));
+  iv_inputs.push_back(c10::IValue(weights));
+  iv_inputs.push_back(c10::IValue(table_offsets));
+  iv_inputs.push_back(c10::IValue(indices));
+  iv_inputs.push_back(c10::IValue(offsets));
+  RECORD_FUNCTION("batched_embedding_backward_sgd_cuda", iv_inputs, at::sequence_number::peek());
+
   at::cuda::OptionalCUDAGuard device_guard;
   device_guard.set_index(weights.get_device());
 
@@ -765,8 +937,8 @@ c10::optional<Tensor> batched_embedding_backward_adagrad_approx_cuda(
           std::pair<uint64_t, uint64_t> rng_engine_inputs;
           {
             auto gen = at::cuda::detail::getDefaultCUDAGenerator();
-            std::lock_guard<std::mutex> lock(gen->mutex_);
-            rng_engine_inputs = gen->philox_engine_inputs(
+            std::lock_guard<std::mutex> lock(gen.mutex());
+            rng_engine_inputs = at::check_generator<at::CUDAGeneratorImpl>(gen)->philox_engine_inputs(
                 L_max * ((D + kWarpSize - 1) / kWarpSize));
           }
           if (indice_weights) {
@@ -863,7 +1035,7 @@ int64_t computeStorageSize(IntArrayRef sizes, IntArrayRef strides) {
 
 Tensor new_managed_tensor(Tensor self, std::vector<std::int64_t> sizes) {
   auto strides = defaultStrides(sizes);
-  auto storage = Storage(self.dtype(), computeStorageSize(sizes, strides),
+  auto storage = Storage(Storage::use_byte_size_t(), computeStorageSize(sizes, strides),
                          &g_managed_allocator,
                          /*resizable=*/false);
   auto tensor = at::empty({0}, self.options()).set_(storage, 0, sizes, strides);
@@ -872,7 +1044,7 @@ Tensor new_managed_tensor(Tensor self, std::vector<std::int64_t> sizes) {
 
 Tensor new_host_mapped_tensor(Tensor self, std::vector<std::int64_t> sizes) {
   auto strides = defaultStrides(sizes);
-  auto storage = Storage(self.dtype(), computeStorageSize(sizes, strides),
+  auto storage = Storage(Storage::use_byte_size_t(), computeStorageSize(sizes, strides),
                          &g_host_mapped_allocator,
                          /*resizable=*/false);
   auto tensor = at::empty({0}, self.options()).set_(storage, 0, sizes, strides);
@@ -1135,8 +1307,8 @@ c10::optional<Tensor> batched_embedding_backward_adagrad_approx_mixed_D_cuda(
           std::pair<uint64_t, uint64_t> rng_engine_inputs;
           {
             auto gen = at::cuda::detail::getDefaultCUDAGenerator();
-            std::lock_guard<std::mutex> lock(gen->mutex_);
-            rng_engine_inputs = gen->philox_engine_inputs(
+            std::lock_guard<std::mutex> lock(gen.mutex());
+            rng_engine_inputs = at::check_generator<at::CUDAGeneratorImpl>(gen)->philox_engine_inputs(
                 L_max * ((total_D + kWarpSize - 1) / kWarpSize));
           }
           if (indice_weights) {
@@ -1448,8 +1620,8 @@ c10::optional<Tensor> batched_embedding_backward_adagrad_exact_mixed_D_cuda(
           std::pair<uint64_t, uint64_t> rng_engine_inputs;
           {
             auto gen = at::cuda::detail::getDefaultCUDAGenerator();
-            std::lock_guard<std::mutex> lock(gen->mutex_);
-            rng_engine_inputs = gen->philox_engine_inputs(
+            std::lock_guard<std::mutex> lock(gen.mutex());
+            rng_engine_inputs = at::check_generator<at::CUDAGeneratorImpl>(gen)->philox_engine_inputs(
                 ((total_D + kWarpSize - 1) / kWarpSize));
           }
           if (indice_weights) {
@@ -1685,17 +1857,17 @@ c10::optional<Tensor> batched_embedding_backward_adagrad_exact_cuda(
           std::pair<uint64_t, uint64_t> rng_engine_inputs;
           {
             auto gen = at::cuda::detail::getDefaultCUDAGenerator();
-            std::lock_guard<std::mutex> lock(gen->mutex_);
+            std::lock_guard<std::mutex> lock(gen.mutex());
             rng_engine_inputs =
-                gen->philox_engine_inputs(((D + kWarpSize - 1) / kWarpSize));
+                at::check_generator<at::CUDAGeneratorImpl>(gen)->philox_engine_inputs(((D + kWarpSize - 1) / kWarpSize));
           }
-          if (indice_weights) {
-            AT_ASSERT(false);
-          } else {
-            auto f = StochasticRoundingAdaGradFunctor<scalar_t, false>(
-                learning_rate, eps, rng_engine_inputs);
-            X(f);
-          }
+          // if (indice_weights) {
+          //   AT_ASSERT(false);
+          // } else {
+          //   auto f = StochasticRoundingAdaGradFunctor<scalar_t, false>(
+          //       learning_rate, eps, rng_engine_inputs);
+          //   X(f);
+          // }
         }
       }));
   AT_CUDA_CHECK(cudaGetLastError());
